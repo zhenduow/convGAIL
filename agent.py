@@ -3,419 +3,178 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch as T
-from transformers import *
 import warnings 
 import random
 import time
+from agent import Agent, PolicyAgent
 warnings.filterwarnings("ignore")
 
-class LinearDeepQNetwork(nn.Module):
+
+class MOIRLAgent():
     '''
-    The linear deep Q network used by the agent.
+    The multi-objective Inverse reinforcement learning Agent for conversational search.
+    This agent has multiple policies each represented by one <agent> object.
     '''
-    def __init__(self, lr, lr_decay, weight_decay, n_actions, input_dims, hidden_size = 16):
-        super(LinearDeepQNetwork, self).__init__()
-        self.fc1 = nn.Linear(input_dims, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, n_actions)
-
-        self.optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay = weight_decay)
-        self.loss = nn.MSELoss()
-        self.device = T.device('cuda' if T.cuda.is_available() else 'cpu')
-        self.to(self.device)
-
-    def forward(self, state):
-        hidden = F.relu(self.fc1(state))
-        score = self.fc2(hidden)
-
-        return score
-
-class LinearDeepNetwork(nn.Module):
-    '''
-    The linear deep network used by the agent.
-    '''
-    def __init__(self, lr, lr_decay, weight_decay, n_actions, input_dims, hidden_size = 16):
-        super(LinearDeepNetwork, self).__init__()
-        self.fc1 = nn.Linear(input_dims, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, n_actions)
-
-        self.optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay = weight_decay)
-        self.loss = nn.MSELoss()
-        self.device = T.device('cuda' if T.cuda.is_available() else 'cpu')
-        self.to(self.device)
-
-    def forward(self, state):
-        hidden = F.relu(self.fc1(state))
-        score = F.softmax(self.fc2(hidden))
-
-        return score
-
-
-class Agent():
-    '''
-    The conversational QA agent.
-    '''
-    def __init__(self, input_dims, n_actions, lr, gamma=0.25, lr_decay = 1e-10, weight_decay = 1e-3,
-                 epsilon=1.0, eps_dec=1e-3, eps_min=0.01, top_k = 1, data_augment = 10):
+    def __init__(self, n_policy, n_action, observation_dim, top_n, lr, weight_decay):
         self.lr = lr
-        self.lr_decay = lr_decay
-        self.input_dims = input_dims
-        self.n_actions = n_actions
-        self.gamma = gamma
-        self.weight_decay = weight_decay 
-        self.epsilon = epsilon
-        self.eps_dec = eps_dec
-        self.eps_min = eps_min
-        self.top_k = top_k
-        self.data_augment = data_augment
-        self.action_space = [i for i in range(self.n_actions)]
-        self.experiences = []
-        self.experiences_replay_times = 3
-        self.loss_history = []
-
-        self.Q = LinearDeepQNetwork(self.lr, self.lr_decay, self.weight_decay, self.n_actions, self.input_dims)
+        self.weight_decay = weight_decay
+        self.n_policy = n_policy
+        self.n_action = n_action
+        self.top_n = top_n
+        self.prior = np.exp(np.random.uniform(0, 1, n_policy))
+        self.prior /= sum(self.prior)
+        self.prior = T.Tensor(self.prior)
+        self.policylist = []
+        self.loss = nn.NLLLoss()    
+        #self.loss = nn.MSELoss()  
+        #self.loss = nn.CrossEntropyLoss()    
         self.device = T.device("cuda")
-        self.Q.to(self.device)
+        self.entropy_weight = T.ones(1).to(self.device)
 
-    def choose_action(self, query_embedding, context_embedding, questions_embeddings, answers_embeddings, question_scores, answer_scores):
-        encoded_q = questions_embeddings[0]
-        for i in range(1, self.top_k):
-            encoded_q = T.cat((encoded_q, questions_embeddings[i]), dim=0)
-            
-        encoded_state = T.cat((query_embedding, context_embedding), dim=0)
-        encoded_state = T.cat((encoded_state, encoded_q), dim=0)
-        encoded_state = T.cat((encoded_state, answers_embeddings[0]), dim=0)
-        encoded_state = T.cat((encoded_state, question_scores[:self.top_k]), dim=0)
-        encoded_state = T.cat((encoded_state, answer_scores[:1]), dim=0)
+        for i in range(n_policy):
+            self.policylist.append(PolicyAgent(n_actions = n_action, input_dims = (3 + self.top_n) * observation_dim + 1 + self.top_n, epsilon = 0))
+        self.params = sum([list(policy.Q.parameters()) for policy in self.policylist], [])
+        self.params.append(self.entropy_weight)
+        self.optimizer = optim.Adam(self.params, lr=self.lr, weight_decay = self.weight_decay)
+        self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99)
     
-        if np.random.random() > self.epsilon:
-            state = T.tensor(encoded_state, dtype=T.float).to(self.device)
-            actions = self.Q.forward(state)
-            action = T.argmax(actions).item()
-        else:
-            action = np.random.choice(self.action_space)
-        return action
-
-    def decrement_epsilon(self):
-        self.epsilon = self.epsilon - self.eps_dec if self.epsilon > self.eps_min else self.eps_min
+    def save(self, path):
+        for i, policy in enumerate(self.policylist):
+            T.save(policy.Q.state_dict(), path + str(i))
+    
+    def load(self, path):
+        for i, policy in enumerate(self.policylist):
+            policy.Q.load_state_dict(T.load(path + str(i)))
 
 
-    def joint_learn(self, state, a_reward, q_reward, state_):
-        # save to experiences for experience replay
-        
-        self.experiences.append([state, a_reward, q_reward, state_])
-        
-        if a_reward < q_reward:
-            for da in range(self.data_augment):
-                self.experiences.append([state, a_reward, q_reward, state_])
-        
-        # sample from past experiences
-        exps = random.sample(self.experiences, min(self.experiences_replay_times, len(self.experiences)))
-        exps.append([state, a_reward, q_reward, state_])
+    def E_step(self, conversation_trajectories):
+        '''
+        The E step of EM algorithm.
+        Compute the probability of each conversation derived from each policy.
+        '''
+        self.z = T.tensor(self.prior.repeat(len(conversation_trajectories),1)).to(self.device)
+        for i, traj in enumerate(conversation_trajectories):
+            # Each trajectory is a list of (state, action) pairs
+            for j, policy in enumerate(self.policylist):
+                for s,a in traj:
+                    # We need to compute the pi(s,a) using current parameters for each policy function
+                    self.z[i,j] *= policy.Q.forward(s)[a]
+            # self.z[i] = T.exp(self.z[i])
+            self.z[i] /= sum(self.z[i])
 
-        for exp in exps:
-            state, a_reward, q_reward, state_ = exp[0], exp[1], exp[2], exp[3]
 
-            query_embedding, context_embedding, questions_embeddings, answers_embeddings, question_scores, answer_scores = state[0], state[1], state[2], state[3], state[4], state[5]
-            query_embedding, context_embedding_, questions_embeddings_, answers_embeddings_, question_scores_, answer_scores_ = state_[0], state_[1], state_[2], state_[3], state_[4], state_[5]
-
-            encoded_q = questions_embeddings[0]
-            for i in range(1, self.top_k):
-                encoded_q = T.cat((encoded_q, questions_embeddings[i]), dim=0)
-
-            encoded_state = T.cat((query_embedding, context_embedding), dim=0)
-            encoded_state = T.cat((encoded_state, encoded_q), dim=0)
-            encoded_state = T.cat((encoded_state, answers_embeddings[0]), dim=0)
-            encoded_state = T.cat((encoded_state, question_scores[:self.top_k]), dim=0)
-            encoded_state = T.cat((encoded_state, answer_scores[:1]), dim=0) 
-
-            encoded_state_ = None
-            if questions_embeddings_ is not None and answers_embeddings_ is not None:
-                encoded_q_ = questions_embeddings_[0]
-                for i in range(1, self.top_k):
-                    encoded_q_ = T.cat((encoded_q_, questions_embeddings_[i]), dim=0)
+    def M_step(self, pos_conversation_trajectories, all_conversation_trajectories):
+        '''
+        M step of the EM algorithm.
+        Update prior distribution of policies and each policy function.
+        '''
+        self.prior = T.mean(self.z, dim=0) # update prior by averaging over samples ('i's)
+        # update policy
+        batch_loss = 0
+        for j, policy in enumerate(self.policylist):
+            self.optimizer.zero_grad()
+            L = T.zeros(1).to(self.device)
+            
+            print("Before update")
+            for i, traj in enumerate(pos_conversation_trajectories):
+                target_a = T.tensor([a for s,a in traj]).to(self.device)
+                # target_a = T.tensor([[1.0, 0.5] if a==0 else [0.0, 1.0]  for s,a in traj]).to(self.device)
+                traj_s = T.stack(([s for s,a in traj])).to(self.device)
+                predicted_a = policy.Q.forward(traj_s).to(self.device)
+                L += self.z[i,j] * self.loss(predicted_a,target_a)
+                print(predicted_a, target_a)
                 
-                encoded_state_ = T.cat((query_embedding, context_embedding_), dim=0)
-                encoded_state_ = T.cat((encoded_state_, encoded_q_), dim=0)
-                encoded_state_ = T.cat((encoded_state_, answers_embeddings_[0]), dim=0)
-                encoded_state_ = T.cat((encoded_state_, question_scores_[:self.top_k]), dim=0)
-                encoded_state_ = T.cat((encoded_state_, answer_scores_[:1]), dim=0)
-            
-            self.Q.optimizer.zero_grad()
-            states = T.tensor(encoded_state, dtype=T.float).to(self.device)
-            a_rewards = T.tensor(a_reward).to(self.device)
-            q_rewards = T.tensor(q_reward).to(self.device)
-            states_ = T.tensor(encoded_state_, dtype=T.float).to(self.device) if encoded_state_ is not None else None
-
-            pred = self.Q.forward(states)
-            q_next = self.Q.forward(states_).max() if encoded_state_ is not None else T.tensor(0).to(self.device)
-            q_target = T.tensor([a_rewards, q_rewards + self.gamma*q_next]).to(self.device) if encoded_state_ is not None else T.tensor([a_rewards, q_rewards]).to(self.device)
-
-            loss = self.Q.loss(q_target, pred).to(self.device)
-            # l1 penalty
-            l1 = 0
-            for p in self.Q.parameters():
-                l1 += p.abs().sum()
-            
-            loss = loss + self.weight_decay * l1
-            self.loss_history.append(loss.item())
-            loss.backward()
-            self.Q.optimizer.step()     
-            
-        self.decrement_epsilon()
-
-
-class BaseAgent():
-    '''
-    The Baseline conversational QA agent.
-    '''
-    def __init__(self, input_dims, n_actions, lr, lr_decay = 1e-10, weight_decay = 1e-3):
-        self.lr = lr
-        self.lr_decay = lr_decay
-        self.input_dims = input_dims
-        self.n_actions = n_actions
-        self.weight_decay = weight_decay 
-        self.loss_history = []
-
-        self.Q = LinearDeepNetwork(self.lr, self.lr_decay, self.weight_decay, self.n_actions, self.input_dims)
-        self.device = T.device("cuda")
-        self.Q.to(self.device)
-
-    def choose_action(self, query_embedding, context_embedding):
-        
-        encoded_state = T.cat((query_embedding, context_embedding), dim=0)
-        state = T.tensor(encoded_state, dtype=T.float).to(self.device)
-        actions = self.Q.forward(state)
-        action = T.argmax(actions).item()
-        
-        return action
-
-    def learn(self, query_embedding, context_embedding, true_label):
-        # save to experiences for experience replay     
-        encoded_state = T.cat((query_embedding, context_embedding), dim=0)
-       
-        self.Q.optimizer.zero_grad()
-        states = T.tensor(encoded_state, dtype=T.float).to(self.device)
-        
-        pred = self.Q.forward(states)
-        q_target = T.tensor([1, 0]).to(self.device) if true_label == 0 else T.tensor([0, 1]).to(self.device)
-        loss = self.Q.loss(q_target, pred).to(self.device)
-            
-        # l1 penalty
-        l1 = 0
-        for p in self.Q.parameters():
-            l1 += p.abs().sum()
-            
-        loss = loss + self.weight_decay * l1
-            
-        self.loss_history.append(loss.item())
-
-        loss.backward()
-        self.Q.optimizer.step()     
-            
-
-
-class ScoreAgent():
-    '''
-    using only the ranking scores.
-    '''
-    def __init__(self, input_dims, n_actions, lr, gamma=0.25, lr_decay = 1e-10, weight_decay = 1e-3,
-                 epsilon=1.0, eps_dec=1e-3, eps_min=0.01, top_k = 1, data_augment = 10):
-        self.lr = lr
-        self.lr_decay = lr_decay
-        self.input_dims = input_dims
-        self.n_actions = n_actions
-        self.gamma = gamma
-        self.weight_decay = weight_decay 
-        self.epsilon = epsilon
-        self.eps_dec = eps_dec
-        self.eps_min = eps_min
-        self.top_k = top_k
-        self.data_augment = data_augment
-        self.action_space = [i for i in range(self.n_actions)]
-        self.experiences = []
-        self.experiences_replay_times = 3
-        self.loss_history = []
-
-        self.Q = LinearDeepQNetwork(self.lr, self.lr_decay, self.weight_decay, self.n_actions, self.input_dims)
-        self.device = T.device("cuda")
-        self.Q.to(self.device)
-
-    def choose_action(self, question_scores, answer_scores):
-        question_scores = T.tensor(question_scores)
-        answer_scores = T.tensor(answer_scores)
-        encoded_state = T.cat((question_scores[:self.top_k], answer_scores[:1]), dim=0)
-
-        if np.random.random() > self.epsilon:
-            'if the random number is greater than exploration threshold, choose the action maximizing Q'
-            state = T.tensor(encoded_state, dtype=T.float).to(self.device)
-            actions = self.Q.forward(state)
-            #print(actions)
-            action = T.argmax(actions).item()
-        else:
-            'randomly choosing an action'
-            action = np.random.choice(self.action_space)
-        return action
-
-    def decrement_epsilon(self):
-        self.epsilon = self.epsilon - self.eps_dec if self.epsilon > self.eps_min else self.eps_min
-
-
-    def joint_learn(self, state, a_reward, q_reward, state_):
-        # save to experiences for experience replay
-        
-        self.experiences.append([state, a_reward, q_reward, state_])
-        
-        if a_reward < q_reward:
-            for da in range(self.data_augment):
-                self.experiences.append([state, a_reward, q_reward, state_])
-        
-        # sample from past experiences
-        exps = random.sample(self.experiences, min(self.experiences_replay_times, len(self.experiences)))
-        exps.append([state, a_reward, q_reward, state_])
-
-        for exp in exps:
-            state, a_reward, q_reward, state_ = exp[0], exp[1], exp[2], exp[3]
-
-            question_scores, answer_scores = state[0], state[1]
-            question_scores_, answer_scores_ = state_[0], state_[1]
-
-            encoded_state = T.cat((question_scores[:self.top_k], answer_scores[:1]), dim=0)
-            if question_scores_ is not None and answer_scores_ is not None:
-                encoded_state_ = T.cat((question_scores_[:self.top_k], answer_scores_[:1]), dim=0)
-            else:
-                encoded_state_ = None
-
-            self.Q.optimizer.zero_grad()
-            states = T.tensor(encoded_state, dtype=T.float).to(self.device)
-            a_rewards = T.tensor(a_reward).to(self.device)
-            q_rewards = T.tensor(q_reward).to(self.device)
-            states_ = T.tensor(encoded_state_, dtype=T.float).to(self.device) if encoded_state_ is not None else None
-
-            pred = self.Q.forward(states)
-            q_next = self.Q.forward(states_).max() if encoded_state_ is not None else T.tensor(0).to(self.device)
-            q_target = T.tensor([a_rewards, q_rewards + self.gamma*q_next]).to(self.device) if encoded_state_ is not None else T.tensor([a_rewards, q_rewards]).to(self.device)
-
-            loss = self.Q.loss(q_target, pred).to(self.device) 
-            # l1 penalty
-            l1 = 0
-            for p in self.Q.parameters():
-                l1 += p.abs().sum()
-            
-            loss = loss + self.weight_decay * l1
-            self.loss_history.append(loss.item())
-            loss.backward()
-            self.Q.optimizer.step()     
-        self.decrement_epsilon()
-
-
-
-class TextAgent():
-    '''
-    Using only the encoded text.
-    '''
-    def __init__(self, input_dims, n_actions, lr, gamma=0.25, lr_decay = 1e-10, weight_decay = 1e-3,
-                 epsilon=1.0, eps_dec=1e-3, eps_min=0.01, top_k = 1, data_augment = 10):
-        self.lr = lr
-        self.lr_decay = lr_decay
-        self.input_dims = input_dims
-        self.n_actions = n_actions
-        self.gamma = gamma
-        self.weight_decay = weight_decay 
-        self.epsilon = epsilon
-        self.eps_dec = eps_dec
-        self.eps_min = eps_min
-        self.top_k = top_k
-        self.data_augment = data_augment
-        self.action_space = [i for i in range(self.n_actions)]
-        self.experiences = []
-        self.experiences_replay_times = 3
-        self.loss_history = []
-
-        self.Q = LinearDeepQNetwork(self.lr, self.lr_decay, self.weight_decay, self.n_actions, self.input_dims)
-        self.device = T.device("cuda")
-        self.Q.to(self.device)
-
-    def choose_action(self, query_embedding, context_embedding, questions_embeddings, answers_embeddings):
-        # Encode text
-        
-        encoded_q = questions_embeddings[0]
-        for i in range(1, self.top_k):
-            encoded_q = T.cat((encoded_q, questions_embeddings[i]), dim=0)
-        encoded_state = T.cat((query_embedding, context_embedding), dim=0)
-        encoded_state = T.cat((encoded_state, encoded_q), dim=0)
-        encoded_state = T.cat((encoded_state, answers_embeddings[0]), dim=0)
-        
-        if np.random.random() > self.epsilon:
-            'if the random number is greater than exploration threshold, choose the action maximizing Q'
-            state = T.tensor(encoded_state, dtype=T.float).to(self.device)
-            actions = self.Q.forward(state)
-            #print(actions)
-            action = T.argmax(actions).item()
-        else:
-            'randomly choosing an action'
-            action = np.random.choice(self.action_space)
-        return action
-
-    def decrement_epsilon(self):
-        self.epsilon = self.epsilon - self.eps_dec if self.epsilon > self.eps_min else self.eps_min
-
-
-    def joint_learn(self, state, a_reward, q_reward, state_):
-        # save to experiences for experience replay
-        
-        self.experiences.append([state, a_reward, q_reward, state_])
-        
-        if a_reward < q_reward:
-            for da in range(self.data_augment):
-                self.experiences.append([state, a_reward, q_reward, state_])
-        
-        # sample from past experiences
-        exps = random.sample(self.experiences, min(self.experiences_replay_times, len(self.experiences)))
-        exps.append([state, a_reward, q_reward, state_])
-
-        for exp in exps:
-            state, a_reward, q_reward, state_ = exp[0], exp[1], exp[2], exp[3]
-
-            query_embedding, context_embedding, questions_embeddings, answers_embeddings= state[0], state[1], state[2], state[3]
-            query_embedding, context_embedding_, questions_embeddings_, answers_embeddings_ = state_[0], state_[1], state_[2], state_[3]
-
-            encoded_q = questions_embeddings[0]
-            for i in range(1, self.top_k):
-                encoded_q = T.cat((encoded_q, questions_embeddings[i]), dim=0)
-
-            encoded_state = T.cat((query_embedding, context_embedding), dim=0)
-            encoded_state = T.cat((encoded_state, encoded_q), dim=0)
-            encoded_state = T.cat((encoded_state, answers_embeddings[0]), dim=0)
-
-            encoded_state_ = None
-            if questions_embeddings_ is not None and answers_embeddings_ is not None:
-
-                encoded_q_ = questions_embeddings_[0]
-                for i in range(1, self.top_k):
-                    encoded_q_ = T.cat((encoded_q_, questions_embeddings_[i]), dim=0)
+            for k, traj in enumerate(all_conversation_trajectories):
+                all_target_a = T.tensor([1-int(a) for s,a in traj]).to(self.device)
+                #all_target_a = T.tensor([[1.0, 0.5] if a==0 else [0.0, 1.0] for s,a in traj]).to(self.device)
+                all_traj_s = T.stack(([s for s,a in traj])).to(self.device)
+                all_predicted_a = policy.Q.forward(all_traj_s).to(self.device)
+                #L += self.z[k,j] * self.loss(all_predicted_a, all_target_a)
+                #print(all_predicted_a, all_target_a)
                 
-                encoded_state_ = T.cat((query_embedding, context_embedding_), dim=0)
-                encoded_state_ = T.cat((encoded_state_, encoded_q_), dim=0)
-                encoded_state_ = T.cat((encoded_state_, answers_embeddings_[0]), dim=0)
-            
-            self.Q.optimizer.zero_grad()
-            states = T.tensor(encoded_state, dtype=T.float).to(self.device)
-            a_rewards = T.tensor(a_reward).to(self.device)
-            q_rewards = T.tensor(q_reward).to(self.device)
-            states_ = T.tensor(encoded_state_, dtype=T.float).to(self.device) if encoded_state_ is not None else None
 
-            pred = self.Q.forward(states)
-            q_next = self.Q.forward(states_).max() if encoded_state_ is not None else T.tensor(0).to(self.device)
-            q_target = T.tensor([a_rewards, q_rewards + self.gamma*q_next]).to(self.device) if encoded_state_ is not None else T.tensor([a_rewards, q_rewards]).to(self.device)
-
-            loss = self.Q.loss(q_target, pred).to(self.device)
-            # l1 penalty
-            l1 = 0
-            for p in self.Q.parameters():
-                l1 += p.abs().sum()
+                '''
+                for k, all_traj in enumerate(all_conversation_trajectories[i]):
+                    # all_t, p = all_traj
+                    all_t = all_traj
+                    # all_target_a = T.tensor([a for s,a in all_t]).to(self.device)
+                    all_target_a = T.tensor([[1.0, 0.0] if a==0 else [0.0, 1.0] for s,a in all_t]).to(self.device)
+                    all_traj_s = T.stack(([s for s,a in all_t])).to(self.device)
+                    all_predicted_a = policy.Q.forward(all_traj_s).to(self.device)
+                    #L -= self.z[i,j] * p * self.loss(all_predicted_a, all_target_a)
+                    L -= self.z[i,j] * self.loss(all_predicted_a, all_target_a)
+                '''
             
-            loss = loss + self.weight_decay * l1
-            self.loss_history.append(loss.item())
-            loss.backward()
-            self.Q.optimizer.step()     
-        self.decrement_epsilon()
+            L = L.to(self.device)
+            L.backward(retain_graph=True)
+            self.optimizer.step()   
+            print("Post update")
+            for i, traj in enumerate(pos_conversation_trajectories):
+                target_a = T.tensor([a for s,a in traj]).to(self.device)
+                traj_s = T.stack(([s for s,a in traj])).to(self.device)
+                predicted_a = policy.Q.forward(traj_s).to(self.device)
+                print(predicted_a, target_a)
+            batch_loss += L.detach().item()
+        
+        #self.scheduler.step()
+        return batch_loss
+    
+
+    def gail_step(self_traj):
+        '''
+        Take a TRPO step to minimize E_i[log\pi(a|s)*p]-\lambda H(\pi)
+        It is still within multi-objective framework.
+        '''
+        self.prior = T.mean(self.z, dim=0) # update prior by averaging over samples ('i's)
+        # update policy
+        batch_loss = 0
+        for j, policy in enumerate(self.policylist):
+            self.optimizer.zero_grad()
+            L = T.zeros(1).to(self.device)
+                
+            for k, traj in enumerate(self_traj):
+                s_a_list, p = traj
+                a_list = T.tensor([a for s,a in s_a_list]).to(self.device)
+                s_list = T.stack(([s for s,a in s_a_list])).to(self.device)
+                predicted_a_list = policy.Q.forward(s_list).to(self.device)
+                L -= self.z[k,j] * p * self.loss(predicted_a_list, a_list) - self.entropy_weight * predicted_a_list.entropy()
+                #print(all_predicted_a, all_target_a)
+
+            L = L.to(self.device)
+            L.backward(retain_graph=True)
+            self.optimizer.step()   
+            print("Post update")
+            for i, traj in enumerate(pos_conversation_trajectories):
+                target_a = T.tensor([a for s,a in traj]).to(self.device)
+                traj_s = T.stack(([s for s,a in traj])).to(self.device)
+                predicted_a = policy.Q.forward(traj_s).to(self.device)
+                print(predicted_a, target_a)
+            batch_loss += L.detach().item()
+        
+        #self.scheduler.step()
+        return batch_loss
+
+
+    def inference_step(self, cur_traj, state):
+        '''
+        The inference step of moirl agent first computes the posterior distribution of policies given existing conversation trajectory.
+        Then the distribution of policies can be used to compute a weighted reward function.
+        '''
+
+        # computing posterior distribution
+        post = T.clone(self.prior).to(self.device)
+        likelihood = T.ones(self.prior.shape).to(self.device)
+        for s,a,_ in cur_traj:
+            for j, policy in enumerate(self.policylist):
+                likelihood[j] *= T.exp(policy.Q.forward(s).to(self.device)[a])/sum(T.exp(policy.Q.forward(s).to(self.device)))
+                
+        post *= likelihood
+        post /= sum(post)
+
+        weighted_reward = T.zeros(self.n_action).to(self.device)
+        for j, policy in enumerate(self.policylist):
+            weighted_reward += T.exp(policy.Q.forward(state)) * post[j]
+        print(weighted_reward)
+        action = T.argmax(weighted_reward).item()
+
+        return state, action
