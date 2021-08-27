@@ -68,53 +68,48 @@ class User:
         return initial_query
 
     
-    def update_state(self, conversation_id, context, action, top_n_question, top_n_answer, use_top_k):
+    def update_state(self, conversation_id, context, top_n_question, top_n_answer, use_top_k):
         '''
         Read the agent action and update the user state, compute reward and return them for save.
         The agent action should be 0 (retrieve an answer) or 1 (ask clarifying question)
         '''
-        patience_used = 0
-        if action == 0:
-            # agent answer the question, evaluate the answer
-            n = len(top_n_answer)
-            context_ = context + ' [SEP] ' + top_n_answer[0]
-            true_rel = [0] * n
-            for i in range(n):
-                try:
-                    true_rel[i] = self.respond_to_question(conversation_id, top_n_answer[i])
-                except:
-                    print("Error in conversation: " + conversation_id)
-            reward = 0
-            for i, rel in enumerate(true_rel):
-                try:
-                    reward += rel/(i+1)
-                except:
-                    reward += 0
+        
+        # agent answer the question, evaluate the answer
+        true_rel = [self.respond_to_question(conversation_id, answer) for answer in top_n_answer]
+        answer_reward = 0
+        for i, rel in enumerate(true_rel):
+            try:
+                answer_reward += rel/(i+1)
+            except:
+                answer_reward += 0
+        answer_reward = min(answer_reward, 1)
             
-            if reward > 1:
-                reward = 1
-            return context_, reward, True, None, patience_used
-        elif action == 1:
-            # agent asks clarifying question, find corresponding answer in the dataset and return
-            done = False
-            correct_question_id = -1
-            user_response_text = ''
-            for qid in range(len(top_n_question)):
-                response = self.respond_to_question(conversation_id, top_n_question[qid])
-                if type(response) == int:
-                    continue
-                else:
-                    if correct_question_id == -1:
-                        #logging.info("Good CQ.")
-                        correct_question_id = qid
-                        user_response_text = response
-            if 0 <= correct_question_id <= (use_top_k - 1):
-                reward = self.cq_reward
-                context_ = context + ' [SEP] ' + top_n_question[correct_question_id] + ' [SEP] ' + user_response_text
-                patience_used = correct_question_id
+        # agent asks clarifying question, find corresponding answer in the dataset and return
+        patience_used = 0
+        question_reward = 0
+        done = False
+        correct_question_id = -1
+        user_response_text = ''
+        for qid in range(len(top_n_question)):
+            response = self.respond_to_question(conversation_id, top_n_question[qid])
+            if type(response) == int:
+                continue
             else:
-                # the agent asks a bad question  
-                reward = self.cq_penalty
-                done = True
-                context_ = context + ' [SEP] ' + top_n_question[0] + ' [SEP] ' + 'This question is not relevant.'
-            return context_, reward, done, top_n_question[correct_question_id], patience_used
+                if correct_question_id == -1:
+                    #logging.info("Good CQ.")
+                    correct_question_id = qid
+                    user_response_text = response
+                    break
+        if 0 <= correct_question_id <= (use_top_k - 1):
+            question_reward = self.cq_reward
+            context_ = context + ' [SEP] ' + top_n_question[correct_question_id] + ' [SEP] ' + user_response_text
+            patience_used = correct_question_id
+        else:
+            # the agent asks a bad question  
+            question_reward = self.cq_penalty
+            done = True
+            context_ = context + ' [SEP] ' + top_n_question[0] + ' [SEP] ' + 'This question is not relevant.'
+        correct_question = top_n_question[correct_question_id]
+        if correct_question_id < 0:
+            correct_question_id = 99
+        return context_, answer_reward, question_reward, correct_question_id + 1, done, correct_question, patience_used
