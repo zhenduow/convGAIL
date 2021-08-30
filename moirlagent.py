@@ -1,14 +1,25 @@
+from math import e
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch as T
 import warnings 
-import random
-import time
+import math
 from agent import Agent, PolicyAgent
 warnings.filterwarnings("ignore")
 
+
+def entropy_e(ts):
+    '''
+    Assuming ts is 2d tensor
+    '''
+    ent = 0
+    for t in ts:
+        for p in t:
+            ent -= p * T.log(p)
+    return ent
+    
 
 class MOIRLAgent():
     '''
@@ -29,7 +40,7 @@ class MOIRLAgent():
         #self.loss = nn.MSELoss()  
         #self.loss = nn.CrossEntropyLoss()    
         self.device = T.device("cuda")
-        self.entropy_weight = T.ones(1).to(self.device)
+        self.entropy_weight = 1e-3*T.ones(1).to(self.device)
 
         for i in range(n_policy):
             self.policylist.append(PolicyAgent(n_actions = n_action, input_dims = (3 + self.top_n) * observation_dim + 1 + self.top_n, epsilon = 0))
@@ -120,7 +131,7 @@ class MOIRLAgent():
         return batch_loss
     
 
-    def gail_step(self_traj):
+    def gail_step(self, self_traj):
         '''
         Take a TRPO step to minimize E_i[log\pi(a|s)*p]-\lambda H(\pi)
         It is still within multi-objective framework.
@@ -131,24 +142,19 @@ class MOIRLAgent():
         for j, policy in enumerate(self.policylist):
             self.optimizer.zero_grad()
             L = T.zeros(1).to(self.device)
-                
+            
             for k, traj in enumerate(self_traj):
                 s_a_list, p = traj
-                a_list = T.tensor([a for s,a in s_a_list]).to(self.device)
-                s_list = T.stack(([s for s,a in s_a_list])).to(self.device)
+                a_list = T.tensor([a for s,a,_ in s_a_list]).to(self.device)
+                s_list = T.stack(([s for s,a,_ in s_a_list])).to(self.device)
                 predicted_a_list = policy.Q.forward(s_list).to(self.device)
-                L -= self.z[k,j] * p * self.loss(predicted_a_list, a_list) - self.entropy_weight * predicted_a_list.entropy()
+                print(predicted_a_list)
+                L -= self.z[k,j] * (1-p) * self.loss(predicted_a_list, a_list) - self.entropy_weight * entropy_e(predicted_a_list)
                 #print(all_predicted_a, all_target_a)
 
             L = L.to(self.device)
             L.backward(retain_graph=True)
             self.optimizer.step()   
-            print("Post update")
-            for i, traj in enumerate(pos_conversation_trajectories):
-                target_a = T.tensor([a for s,a in traj]).to(self.device)
-                traj_s = T.stack(([s for s,a in traj])).to(self.device)
-                predicted_a = policy.Q.forward(traj_s).to(self.device)
-                print(predicted_a, target_a)
             batch_loss += L.detach().item()
         
         #self.scheduler.step()
@@ -173,7 +179,7 @@ class MOIRLAgent():
 
         weighted_reward = T.zeros(self.n_action).to(self.device)
         for j, policy in enumerate(self.policylist):
-            weighted_reward += T.exp(policy.Q.forward(state)) * post[j]
+            weighted_reward += policy.Q.forward(state) * post[j]
         print(weighted_reward)
         action = T.argmax(weighted_reward).item()
 
