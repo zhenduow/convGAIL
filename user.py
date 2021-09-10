@@ -112,4 +112,4 @@ class User:
         correct_question = top_n_question[correct_question_id]
         if correct_question_id < 0:
             correct_question_id = 99
-        return context_, answer_reward, question_reward, correct_question_id + 1, done, correct_question, patience_used
+        return context_, answer_reward, question_reward, correct_question_id, done, correct_question, patience_used
