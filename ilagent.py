@@ -44,8 +44,9 @@ class ILAgent():
     The multi-objective Inverse reinforcement learning Agent for conversational search.
     This agent has multiple policies each represented by one <agent> object.
     '''
-    def __init__(self, n_action, observation_dim, top_n, lr, weight_decay):
+    def __init__(self, n_action, observation_dim, top_n, lr, lrdc, weight_decay):
         self.lr = lr
+        self.lrdc = lrdc
         self.weight_decay = weight_decay
         self.n_action = n_action
         self.top_n = top_n
@@ -56,7 +57,7 @@ class ILAgent():
         self.params = self.policy.parameters()
         #self.params.append(self.entropy_weight)
         self.optimizer = optim.Adam(self.params, lr=self.lr, weight_decay = self.weight_decay)
-        self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.95)
+        self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=self.lrdc)
     
     def save(self, path):
         T.save(self.policy.state_dict(), path)
