@@ -49,7 +49,7 @@ def save_to_memory(query, context, memory, questions, answers, questions_scores,
     memory[query][context] = {}
     with T.no_grad():
         memory[query][context]['embedding'] = T.squeeze(embedding_model(T.tensor([tokenizer.encode(context, add_special_tokens=True)]).to(device))[0])[0].detach().cpu()
-        memory[query][context]['questions_embeddings'] = [T.squeeze(embedding_model(T.tensor([tokenizer.encode(questions[i], add_special_tokens=True)]).to(device))[0])[0].detach().cpu() for i in range(3)]
+        memory[query][context]['questions_embeddings'] = [T.squeeze(embedding_model(T.tensor([tokenizer.encode(questions[i], add_special_tokens=True)]).to(device))[0])[0].detach().cpu() for i in range(3)] # hard coding max tolerance to save memory
         memory[query][context]['answers_embeddings'] = [T.squeeze(embedding_model(T.tensor([tokenizer.encode(answers[0], add_special_tokens=True)]).to(device))[0])[0].detach().cpu()]
         memory[query][context]['questions'] = questions
         memory[query][context]['answers'] = answers
@@ -164,7 +164,11 @@ def main(args):
     random.seed(2020)
     device = "cuda:0" if T.cuda.is_available() else "cpu"
     print(args)
-    output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cv'+ str(args.cv)+'_t'+str(user_tolerance)+'_p'+str(args.user_patience)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_cas'+str(args.cascade_p), 'w')
+    output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cv'+ str(args.cv)+'_t'+str(args.user_tolerance)+'_p'+str(args.user_patience)+'_lr'+str(args.lr)+'_lrdc'+str(args.lrdc)+'_r'+str(args.cq_reward)+'_cas'+str(args.cascade_p), 'w')
+    train_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cv'+ str(args.cv)+'_t'+str(args.user_tolerance)+'_p'+str(args.user_patience)+'_lr'+str(args.lr)+'_lrdc'+str(args.lrdc)+'_r'+str(args.cq_reward)+'_cas'+str(args.cascade_p) + '_train', 'w')
+    val_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cv'+ str(args.cv)+'_t'+str(args.user_tolerance)+'_p'+str(args.user_patience)+'_lr'+str(args.lr)+'_lrdc'+str(args.lrdc)+'_r'+str(args.cq_reward)+'_cas'+str(args.cascade_p) + '_val', 'w')
+    test_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cv'+ str(args.cv)+'_t'+str(args.user_tolerance)+'_p'+str(args.user_patience)+'_lr'+str(args.lr)+'_lrdc'+str(args.lrdc)+'_r'+str(args.cq_reward)+'_cas'+str(args.cascade_p) + '_test', 'w')
+
 
     # load data
     train_dataset = ConversationDataset('data/' + args.dataset_name + '-Complete/train' + args.cv + '/', args.batch_size, args.max_data_size)
@@ -177,7 +181,7 @@ def main(args):
     question_reranker, answer_reranker = create_rerankers(args.dataset_name, args.reranker_name)
 
     # initialize agents
-    agent = Agent(lr = 1e-4, input_dims = (3 + user_tolerance) * args.observation_dim + 1 + user_tolerance, top_k = user_tolerance, n_actions=args.n_action, gamma = 1 - args.cq_reward, weight_decay = args.weight_decay) # query, context, answer, and topn questions embedding + 1 answer score and topn question score
+    agent = Agent(lr = 1e-4, input_dims = (3 + args.user_tolerance) * args.observation_dim + 1 + args.user_tolerance, top_k = args.user_tolerance, n_actions=args.n_action, gamma = 1 - args.cq_reward, weight_decay = args.weight_decay) # query, context, answer, and topn questions embedding + 1 answer score and topn question score
     base_agent = BaseAgent(lr = 1e-4, input_dims = 2 * args.observation_dim, n_actions = args.n_action, weight_decay = args.weight_decay)
     ilagent = ILAgent(n_action = args.n_action, observation_dim = args.observation_dim, top_n = args.il_topn, lr= args.lr, lrdc=args.lrdc, weight_decay= args.weight_decay)
     
@@ -189,8 +193,8 @@ def main(args):
     initialize_dirs(args.dataset_name, args.reranker_name, args.cv)
     
     if args.load_checkpoint == True:
-        agent.load(args.dataset_name + '_experiments/checkpoints/' + args.checkpoint)
-        base_agent.load(args.dataset_name + '_experiments/checkpoints/' + args.checkpoint_base)
+        #agent.load(args.dataset_name + '_experiments/checkpoints/' + args.checkpoint)
+        #base_agent.load(args.dataset_name + '_experiments/checkpoints/' + args.checkpoint_base)
         ilagent.load(args.dataset_name + '_experiments/checkpoints/' + args.checkpoint_il)
     
     X = []
@@ -202,9 +206,9 @@ def main(args):
         train_worse, train_q0_worse, train_q1_worse, train_q2_worse, train_base_worse, train_il_worse = [],[],[],[],[],[]
         train_ecrr, train_q0_ecrr, train_q1_ecrr, train_q2_ecrr, train_oracle_ecrr, train_base_ecrr, train_il_ecrr = [],[],[],[],[],[],[]
         il_loss = 0
+        avg_turns = 0
         for batch_serial, batch in enumerate(train_dataset.batches):
-            all_pos_traj = [] # all conversation trajectories used for il
-            all_neg_traj = []
+            all_expert_traj = [] # all conversation trajectories used for il
             all_self_traj = []
             # load state information from cached memory
             if os.path.exists(args.dataset_name + '_experiments/embedding_cache/' + args.reranker_name + '/' + args.cv + '/train/memory.batchsave' + str(batch_serial)):
@@ -257,10 +261,10 @@ def main(args):
                     base_action = base_agent.choose_action(query_embedding, context_embedding)
                     state, il_action = ilagent.inference_step(query_embedding, context_embedding, questions_embeddings, answers_embeddings, questions_scores, answers_scores)
                    
-                    context_, answer_reward, question_reward, correct_question_rank, q_done, good_question, patience_this_turn = user.update_state(train_id, context, questions, answers, use_top_k = max(user_tolerance - patience_used, 1))
-                    patience_used = max(patience_used + patience_this_turn, user_tolerance)
+                    context_, answer_reward, question_reward, correct_question_rank, q_done, good_question, patience_this_turn = user.update_state(train_id, context, questions, answers, use_top_k = max(args.user_tolerance - patience_used, 1))
+                    patience_used = max(patience_used + patience_this_turn, args.user_tolerance)
                     output.write('act '+str(action)+' base act '+str(base_action)+' il act '+str(il_action)+' a reward '+str(answer_reward)+' q reward '+str(question_reward) +' cq rank '+str(correct_question_rank) +'\n')
-                    output.write(good_question + '\n')
+                    train_output.write(str(i)+' '+str(train_id)+' '+str(n_round)+' '+str(action)+' '+str(base_action)+' '+str(il_action)+' '+str(answer_reward)+' '+str(correct_question_rank) +'\n')
                     a_traj.append((state, answer_reward))
                     q_traj.append((state, correct_question_rank))
                     il_traj.append((state, il_action,[answer_reward, correct_question_rank][il_action]))
@@ -293,7 +297,7 @@ def main(args):
 
                     # non-deterministic methods evaluation
                     if not stop:
-                        train_worse.append(1 if (action == 0 and answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward) \
+                        train_worse.append(1 if (action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
                             or (action == 1  and question_reward == args.cq_reward - 1) else 0)
                         if (action == 0 or (action == 1 and question_reward == args.cq_reward - 1)):
                             stop = True 
@@ -301,7 +305,7 @@ def main(args):
                     
 
                     if not base_stop:
-                        train_base_worse.append(1 if (base_action == 0 and answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward) \
+                        train_base_worse.append(1 if (base_action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
                             or (base_action == 1  and question_reward == args.cq_reward - 1) else 0)
                         if (base_action == 0 or (base_action == 1 and question_reward == args.cq_reward - 1)):
                             base_stop = True
@@ -309,7 +313,7 @@ def main(args):
 
                     
                     if not il_stop:
-                        train_il_worse.append(1 if (il_action == 0 and answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward) \
+                        train_il_worse.append(1 if (il_action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
                             or (il_action == 1  and question_reward == args.cq_reward - 1) else 0)
                         if (il_action == 0 or (il_action == 1 and question_reward == args.cq_reward - 1)):
                             il_stop = True 
@@ -318,7 +322,7 @@ def main(args):
                     # deterministic methods evaluation and store optimal trajectory 
                     if n_round == 0:
                         train_q0_scores.append(answer_reward)
-                        train_q0_worse.append(1 if answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward else 0)
+                        train_q0_worse.append(1 if answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward else 0)
                         train_q0_ecrr.append(answer_reward)
                         train_q1_ecrr.append(args.cascade_p**correct_question_rank)
                         train_q2_ecrr.append(args.cascade_p**correct_question_rank)
@@ -329,7 +333,7 @@ def main(args):
                             train_q2_worse.append(1)
                     elif n_round == 1:
                         train_q1_scores.append(answer_reward)
-                        train_q1_worse.append(1 if answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward else 0)
+                        train_q1_worse.append(1 if answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward else 0)
                         train_q1_ecrr[-1] *= answer_reward
                         train_q2_ecrr[-1] *= args.cascade_p**correct_question_rank
                         if q_done:
@@ -338,7 +342,7 @@ def main(args):
                     elif n_round == 2:
                         train_q2_scores.append(answer_reward)
                         train_q2_ecrr[-1] *= answer_reward
-                        train_q2_worse.append(1 if answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward else 0)
+                        train_q2_worse.append(1 if answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward else 0)
 
                     # ecrr evaluation
                     if 'ecrr' in locals():
@@ -373,7 +377,12 @@ def main(args):
                 best_answer_reward = a_traj[best_answer_step][1]
                 train_oracle_scores.append(best_answer_reward)
                 train_oracle_ecrr.append(best_ecrr)
-                
+                avg_turns += best_answer_step
+
+                expert_traj = []
+                for step in range(best_answer_step-1):
+                    expert_traj.append((q_traj[step][0], 1))
+                expert_traj.append((a_traj[best_answer_step][0], 0))                
                 self_traj = []
                 # create self trajectories
                 for step in range(len(il_traj)):
@@ -384,12 +393,13 @@ def main(args):
                 # add positive and self trajectory to batch
                 self_traj_ecrr = compute_trajectory_ecrr(self_traj, args.cascade_p)
                 all_self_traj.append((self_traj, self_traj_ecrr/(best_ecrr+1e-6)))
+                all_expert_traj.append(expert_traj)
 
             # save memory per batch
             T.save(memory, args.dataset_name + '_experiments/embedding_cache/' + args.reranker_name + '/' + args.cv + '/train/memory.batchsave' + str(batch_serial))
             del memory
             
-            batch_loss = ilagent.gail_step(all_self_traj)
+            batch_loss = ilagent.gail_step(all_expert_traj, all_self_traj)
             il_loss += batch_loss
             
             T.cuda.empty_cache()
@@ -414,6 +424,7 @@ def main(args):
 
         output.write("avg loss " + str(np.mean(agent.loss_history)) + '\n')
         output.write("il loss " + str(il_loss) + '\n')
+        output.write("avg cq "+str(avg_turns/(args.batch_size*len(train_dataset.batches)))+'\n')
 
         # save checkpoint
         #agent.save(args.dataset_name + '_experiments/checkpoints/' + str(np.mean(agent.loss_history)))
@@ -425,11 +436,11 @@ def main(args):
         train_il_loss_hist.append(il_loss)
 
         plt.figure()
-        plt.plot(X, train_il_ecrr_hist, label="train_mrr")
+        plt.plot(X, train_il_ecrr_hist, label="train_ecrr")
         plt.plot(X, train_il_loss_hist, label="train_loss")
         plt.legend()
 
-        plt.savefig(args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_train.png')
+        plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_train.png')
 
         ## val
         val_scores, val_q0_scores, val_q1_scores, val_q2_scores, val_oracle_scores, val_base_scores, val_il_scores = [],[],[],[],[],[],[]
@@ -493,10 +504,11 @@ def main(args):
                     # convil
                     state, il_action = ilagent.inference_step(query_embedding, context_embedding, questions_embeddings, answers_embeddings, questions_scores, answers_scores)
 
-                    context_, answer_reward, question_reward, correct_question_rank, q_done, good_question, patience_this_turn = user.update_state(val_id, context, questions, answers, use_top_k = max(user_tolerance - patience_used, 1))
-                    patience_used = max(patience_used + patience_this_turn, user_tolerance)
+                    context_, answer_reward, question_reward, correct_question_rank, q_done, good_question, patience_this_turn = user.update_state(val_id, context, questions, answers, use_top_k = max(args.user_tolerance - patience_used, 1))
+                    patience_used = max(patience_used + patience_this_turn, args.user_tolerance)
                     cur_traj.append((state, il_action,[answer_reward, correct_question_rank][il_action])) # update current conversation trajectory
                     output.write('act '+str(action)+' base act '+str(base_action)+' il act '+str(il_action)+' a reward '+str(answer_reward)+' q reward '+str(question_reward) +' cq rank '+str(correct_question_rank) +'\n')
+                    val_output.write(str(i)+' '+str(val_id)+' '+str(n_round)+' '+str(action)+' '+str(base_action)+' '+str(il_action)+' '+str(answer_reward)+' '+str(correct_question_rank) +'\n')
 
                     a_traj.append((state, answer_reward))
                     q_traj.append((state, correct_question_rank))
@@ -520,7 +532,7 @@ def main(args):
 
                     # non-deterministic models evaluation
                     if not stop:
-                        val_worse.append(1 if (action == 0 and answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward) \
+                        val_worse.append(1 if (action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
                             or (action == 1  and question_reward == args.cq_reward - 1) else 0)
                         if (action == 0 or (action == 1 and question_reward == args.cq_reward - 1)):
                             stop = True
@@ -528,7 +540,7 @@ def main(args):
                             val_efficiency.append(compute_efficiency(answer_reward, n_round + 1) if action ==0 else 0)
 
                     if not base_stop:
-                        val_base_worse.append(1 if (base_action == 0 and answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward) \
+                        val_base_worse.append(1 if (base_action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
                             or (base_action == 1  and question_reward == args.cq_reward - 1) else 0)
                         if (base_action == 0 or (base_action == 1 and question_reward == args.cq_reward - 1)):
                             base_stop = True
@@ -536,7 +548,7 @@ def main(args):
                             val_base_efficiency.append(compute_efficiency(answer_reward, n_round + 1) if base_action ==0 else 0)
 
                     if not il_stop:
-                        val_il_worse.append(1 if (il_action == 0 and answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward) \
+                        val_il_worse.append(1 if (il_action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
                             or (il_action == 1  and question_reward == args.cq_reward - 1) else 0)
                         if (il_action == 0 or (il_action == 1 and question_reward == args.cq_reward - 1)):
                             il_stop = True
@@ -546,7 +558,7 @@ def main(args):
                     # baseline models evaluations
                     if n_round == 0:
                         val_q0_scores.append(answer_reward)
-                        val_q0_worse.append(1 if answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward else 0)
+                        val_q0_worse.append(1 if answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward else 0)
                         val_q0_ecrr.append(answer_reward)
                         val_q1_ecrr.append(args.cascade_p**correct_question_rank)
                         val_q2_ecrr.append(args.cascade_p**correct_question_rank)
@@ -557,7 +569,7 @@ def main(args):
                             val_q2_worse.append(1)
                     elif n_round == 1:
                         val_q1_scores.append(answer_reward)
-                        val_q1_worse.append(1 if answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward else 0)
+                        val_q1_worse.append(1 if answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward else 0)
                         val_q1_ecrr[-1] *= answer_reward
                         val_q2_ecrr[-1] *= args.cascade_p**correct_question_rank
                         if q_done:
@@ -566,7 +578,7 @@ def main(args):
                     elif n_round == 2:
                         val_q2_scores.append(answer_reward)
                         val_q2_ecrr[-1] *= answer_reward
-                        val_q2_worse.append(1 if answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward else 0)
+                        val_q2_worse.append(1 if answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward else 0)
 
                     # ecrr evaluation
                     if 'ecrr' in locals():
@@ -632,9 +644,9 @@ def main(args):
         plt.plot(X, val_il_ecrr_hist, label="val_ecrr")
         plt.legend()
 
-        plt.savefig(args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_val.png')
+        plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_val.png')
 
-        ## test
+        ## test 
         test_scores, test_q0_scores, test_q1_scores, test_q2_scores, test_oracle_scores, test_base_scores, test_il_scores = [],[],[],[],[],[],[]
         test_worse, test_q0_worse, test_q1_worse,test_q2_worse, test_base_worse, test_il_worse = [],[],[],[],[],[]
         test_efficiency, test_oracle_efficiency, test_base_efficiency, test_il_efficiency = [], [], [], []
@@ -693,11 +705,12 @@ def main(args):
                     base_action = base_agent.choose_action(query_embedding, context_embedding)                    
                     # convil
                     state, il_action = ilagent.inference_step(query_embedding, context_embedding, questions_embeddings, answers_embeddings, questions_scores, answers_scores)
-                    context_, answer_reward, question_reward, correct_question_rank, q_done, good_question, patience_this_turn = user.update_state(test_id, context, questions, answers, use_top_k = max(user_tolerance - patience_used, 1))
-                    patience_used = max(patience_used + patience_this_turn, user_tolerance)
+                    context_, answer_reward, question_reward, correct_question_rank, q_done, good_question, patience_this_turn = user.update_state(test_id, context, questions, answers, use_top_k = max(args.user_tolerance - patience_used, 1))
+                    patience_used = max(patience_used + patience_this_turn, args.user_tolerance)
                     
                     cur_traj.append((state, il_action,[answer_reward, correct_question_rank][il_action])) # update current conversation trajectory
                     output.write('act '+str(action)+' base act '+str(base_action)+' il act '+str(il_action)+' a reward '+str(answer_reward)+' q reward '+str(question_reward) +' cq rank '+str(correct_question_rank) +'\n')
+                    test_output.write(str(i)+' '+str(test_id)+' '+str(n_round)+' '+str(action)+' '+str(base_action)+' '+str(il_action)+' '+str(answer_reward)+' '+str(correct_question_rank) +'\n')
 
                     a_traj.append((state, answer_reward))
                     q_traj.append((state, correct_question_rank))
@@ -720,7 +733,7 @@ def main(args):
                         query_embedding, context_embedding_, questions_, answers_, questions_embeddings_, answers_embeddings_, questions_scores_, answers_scores_ = read_from_memory(query, context_, memory)
                     # non-deterministic models evaluation
                     if not stop:
-                        test_worse.append(1 if (action == 0 and answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward) \
+                        test_worse.append(1 if (action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
                             or (action == 1  and question_reward == args.cq_reward - 1) else 0)                    
                         if (action == 0 or (action == 1 and question_reward == args.cq_reward - 1)):
                             stop = True
@@ -728,7 +741,7 @@ def main(args):
                             test_efficiency.append(compute_efficiency(answer_reward, n_round + 1) if action ==0 else 0)
 
                     if not base_stop:
-                        test_base_worse.append(1 if (base_action == 0 and answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward) \
+                        test_base_worse.append(1 if (base_action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
                             or (base_action == 1  and question_reward == args.cq_reward - 1) else 0)
                         if (base_action == 0 or (base_action == 1 and question_reward == args.cq_reward - 1)):
                             base_stop = True
@@ -736,7 +749,7 @@ def main(args):
                             test_base_efficiency.append(compute_efficiency(answer_reward, n_round + 1) if action ==0 else 0)
                     
                     if not il_stop:
-                        test_il_worse.append(1 if (il_action == 0 and answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward) \
+                        test_il_worse.append(1 if (il_action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
                             or (il_action == 1  and question_reward == args.cq_reward - 1) else 0)
                         if (il_action == 0 or (il_action == 1 and question_reward == args.cq_reward - 1)):
                             il_stop = True
@@ -746,7 +759,7 @@ def main(args):
                     # baseline models evaluations
                     if n_round == 0:
                         test_q0_scores.append(answer_reward)
-                        test_q0_worse.append(1 if answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward else 0)
+                        test_q0_worse.append(1 if answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward else 0)
                         test_q0_ecrr.append(answer_reward)
                         test_q1_ecrr.append(args.cascade_p**correct_question_rank)
                         test_q2_ecrr.append(args.cascade_p**correct_question_rank)
@@ -757,7 +770,7 @@ def main(args):
                             test_q2_worse.append(1)
                     elif n_round == 1:
                         test_q1_scores.append(answer_reward)
-                        test_q1_worse.append(1 if answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward else 0)
+                        test_q1_worse.append(1 if answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward else 0)
                         test_q1_ecrr[-1] *= answer_reward
                         test_q2_ecrr[-1] *= args.cascade_p**correct_question_rank
                         if q_done:
@@ -765,7 +778,7 @@ def main(args):
                             test_q2_worse.append(1)
                     elif n_round == 2:
                         test_q2_scores.append(answer_reward)
-                        test_q2_worse.append(1 if answer_reward < float(1/user_tolerance) and question_reward == args.cq_reward else 0)
+                        test_q2_worse.append(1 if answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward else 0)
                         test_q2_ecrr[-1] *= answer_reward
 
                     # ecrr evaluation
@@ -831,8 +844,11 @@ def main(args):
         plt.plot(X, test_il_mrr_hist, label="test_mrr")
         plt.plot(X, test_il_ecrr_hist, label="test_ecrr")
         plt.legend()
-        plt.savefig(args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_test.png')
+        plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_test.png')
     output.close()
+    train_output.close()
+    val_output.close()
+    test_output.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -853,7 +869,6 @@ if __name__ == '__main__':
     parser.add_argument('--train_iter', type = int, default = 50)
     parser.add_argument('--batch_size', type = int, default = 100)
     parser.add_argument('--max_data_size', type = int, default = 10000)
-    parser.add_argument('--test', type = float, default = 0.1)
     parser.add_argument('--checkpoint', type = str, default = '')
     parser.add_argument('--checkpoint_base', type = str, default = '')
     parser.add_argument('--checkpoint_il', type = str, default = '')
