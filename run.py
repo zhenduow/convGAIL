@@ -399,7 +399,8 @@ def main(args):
             T.save(memory, args.dataset_name + '_experiments/embedding_cache/' + args.reranker_name + '/' + args.cv + '/train/memory.batchsave' + str(batch_serial))
             del memory
             
-            batch_loss = ilagent.gail_step(all_expert_traj, all_self_traj)
+            #batch_loss = ilagent.gail_step(all_self_traj)
+            batch_loss = ilagent.trpo_update(all_self_traj)
             il_loss += batch_loss
             
             T.cuda.empty_cache()
