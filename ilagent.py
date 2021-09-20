@@ -6,6 +6,7 @@ import torch.optim as optim
 import torch as T
 import warnings 
 import math
+from T.distributions import Categorical
 warnings.filterwarnings("ignore")
 
 
@@ -32,6 +33,14 @@ class LinearDeepNetwork(nn.Module):
             nn.Linear(hidden_size, n_actions),
             nn.Softmax(),
         )
+        
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                T.nn.init.xavier_uniform(m.weight)
+                m.bias.data.fill_(0.01)
+
+        self.net.apply(init_weights)
+
         self.device = T.device('cuda' if T.cuda.is_available() else 'cpu')
         self.to(self.device)
 
@@ -52,7 +61,7 @@ class ILAgent():
         self.top_n = top_n
         self.loss = nn.CrossEntropyLoss()    
         self.device = T.device('cuda' if T.cuda.is_available() else 'cpu')
-        self.entropy_weight = 1e-8*T.ones(1).to(self.device)
+        self.entropy_weight = 1e-3*T.ones(1).to(self.device)
         self.policy = LinearDeepNetwork(n_actions = n_action, input_dims = (2) * observation_dim + (2) * self.top_n)
         self.params = self.policy.parameters()
         #self.params.append(self.entropy_weight)
@@ -65,7 +74,7 @@ class ILAgent():
     def load(self, path):
         self.policy.load_state_dict(T.load(path))
 
-    def gail_step(self, self_traj):
+    def gail_step(self, all_expert_traj, all_self_traj):
         '''
         Take a TRPO step to minimize E_i[log\pi(a|s)*p]-\lambda H(\pi)
         '''
@@ -74,14 +83,23 @@ class ILAgent():
         self.optimizer.zero_grad()
         L = T.zeros(1).to(self.device)
 
-        print("prior update")  
-        for k, traj in enumerate(self_traj):
-            s_a_list, p = traj
-            a_list = T.tensor([a for s,a,_ in s_a_list]).to(self.device)
-            s_list = T.stack(([s for s,a,_ in s_a_list])).to(self.device)
-            predicted_a_list = self.policy.forward(s_list).to(self.device)
-            L -= (1-p) * self.loss(predicted_a_list, a_list) + self.entropy_weight * entropy_e(predicted_a_list)
-            print(predicted_a_list, a_list)
+
+        print("prior update")
+        '''  
+        for j, traj in enumerate(all_expert_traj):
+            expert_a_list = T.tensor([a for s,a in traj]).to(self.device)
+            expert_s_list = T.stack(([s for s,a in traj])).to(self.device)
+            predicted_a_list = self.policy.forward(expert_s_list).to(self.device)
+            L += self.loss(predicted_a_list, expert_a_list)
+        '''
+        
+        for k, traj in enumerate(all_self_traj):
+            self_s_a_list, p = traj
+            self_a_list = T.tensor([a for s,a,_ in self_s_a_list]).to(self.device)
+            self_s_list = T.stack(([s for s,a,_ in self_s_a_list])).to(self.device)
+            predicted_a_list = self.policy.forward(self_s_list).to(self.device)
+            L +=  -(1-p) * self.loss(predicted_a_list, self_a_list) - self.entropy_weight * entropy_e(predicted_a_list)
+            print(predicted_a_list, self_a_list)
 
         L = L.to(self.device)
         L.backward() 
@@ -89,12 +107,12 @@ class ILAgent():
         batch_loss += L.detach().item()
 
         print("post update")  
-        for k, traj in enumerate(self_traj):
-            s_a_list, p = traj
-            a_list = T.tensor([a for s,a,_ in s_a_list]).to(self.device)
-            s_list = T.stack(([s for s,a,_ in s_a_list])).to(self.device)
-            predicted_a_list = self.policy.forward(s_list).to(self.device)
-            print(predicted_a_list, a_list)
+        for k, traj in enumerate(all_self_traj):
+            self_s_a_list, p = traj
+            self_a_list = T.tensor([a for s,a,_ in self_s_a_list]).to(self.device)
+            self_s_list = T.stack(([s for s,a,_ in self_s_a_list])).to(self.device)
+            predicted_a_list = self.policy.forward(self_s_list).to(self.device)
+            print(predicted_a_list, self_a_list)
     
         return batch_loss
 
@@ -112,5 +130,6 @@ class ILAgent():
         state = T.tensor(encoded_state, dtype=T.float).to(self.device)
         pp = self.policy.forward(state)
         action = T.argmax(pp).item()
-
+        #dist = Categorical(action)
+        #sample_action = dist.sample().item()
         return state, action
