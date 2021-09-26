@@ -9,7 +9,7 @@ import math
 from torch.distributions import Categorical
 warnings.filterwarnings("ignore")
 
-T.set_printoptions(sci_mode=False)
+T.set_printoptions(sci_mode=False, threshold=10000)
 
 def entropy_e(ts):
     '''
@@ -60,6 +60,10 @@ def conjugate_gradient(A, b, delta=0., max_iterations=10):
     return x
 
 
+
+def surrogate_loss(new_probabilities, old_probabilities, advantages):
+    return (new_probabilities / old_probabilities * advantages).mean()
+
 class LinearDeepNetwork(nn.Module):
     '''
     The linear deep network used by the agent.
@@ -78,7 +82,7 @@ class LinearDeepNetwork(nn.Module):
                 T.nn.init.xavier_uniform(m.weight)
                 m.bias.data.fill_(0.01)
 
-        self.net.apply(init_weights)
+        #self.net.apply(init_weights)
 
         self.device = T.device('cuda' if T.cuda.is_available() else 'cpu')
         self.to(self.device)
@@ -92,7 +96,7 @@ class ILAgent():
     The multi-objective Inverse reinforcement learning Agent for conversational search.
     This agent has multiple policies each represented by one <agent> object.
     '''
-    def __init__(self, n_action, observation_dim, top_n, lr, lrdc, weight_decay, max_d_kl = 0.01):
+    def __init__(self, n_action, observation_dim, top_n, lr, lrdc, weight_decay, max_d_kl, entropy_weight):
         self.lr = lr
         self.lrdc = lrdc
         self.weight_decay = weight_decay
@@ -100,7 +104,7 @@ class ILAgent():
         self.top_n = top_n
         self.loss = nn.CrossEntropyLoss()    
         self.device = T.device('cuda' if T.cuda.is_available() else 'cpu')
-        self.entropy_weight = 1e-3*T.ones(1).to(self.device)
+        self.entropy_weight = entropy_weight*T.ones(1).to(self.device)
         self.policy = LinearDeepNetwork(n_actions = n_action, input_dims = (2) * observation_dim + (2) * self.top_n)
         self.params = self.policy.parameters()
         self.max_d_kl = max_d_kl
@@ -138,7 +142,7 @@ class ILAgent():
             self_a_list = T.tensor([a for s,a,_ in self_s_a_list]).to(self.device)
             self_s_list = T.stack(([s for s,a,_ in self_s_a_list])).to(self.device)
             predicted_a_list = self.policy.forward(self_s_list).to(self.device)
-            L +=  -(1-p) * self.loss(predicted_a_list, self_a_list) - self.entropy_weight * entropy_e(predicted_a_list)
+            L += -(1-p) * self.loss(predicted_a_list, self_a_list) - self.entropy_weight * entropy_e(predicted_a_list)
             print(predicted_a_list, self_a_list)
 
         L = L.to(self.device)
@@ -163,13 +167,15 @@ class ILAgent():
         '''
         # update policy
         batch_loss = 0
+        eps = 1e-4
 
-        self_a_list = T.LongTensor([a for self_s_a_list,_ in all_self_traj for s,a,_ in self_s_a_list]).to(self.device)
-        self_s_list = T.stack(([s for self_s_a_list,_ in all_self_traj for s,a,_ in self_s_a_list])).to(self.device)
-        self_p_list = T.tensor([(1-p) for self_s_a_list,p in all_self_traj for s,a,_ in self_s_a_list]).to(self.device)
+        self_a_list = T.LongTensor([a for self_traj in all_self_traj for _,a,_ in self_traj]).to(self.device)
+        self_s_list = T.stack(([s for self_traj in all_self_traj for s,_,_ in self_traj])).to(self.device)
+        self_p_list = T.tensor([(1-p) for self_traj in all_self_traj for _,_,p in self_traj]).to(self.device)
         predicted_a_list = self.policy.forward(self_s_list).to(self.device)
         predicted_probs = predicted_a_list[range(predicted_a_list.shape[0]),self_a_list]
-        L = -(T.mul(T.log(predicted_probs), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list).to(self.device)
+        #L = -(T.mul(T.log(predicted_probs), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list).to(self.device)
+        L = -(T.mul(T.log(predicted_probs), self_p_list)).mean() 
         print('L ', L)
         print("prior update")
         print(predicted_a_list, self_a_list, self_p_list)
@@ -201,7 +207,8 @@ class ILAgent():
                 predicted_a_list_new = self.policy.forward(self_s_list).to(self.device)
                 predicted_probs_new = predicted_a_list_new[range(predicted_a_list.shape[0]),self_a_list]
 
-                L_new = -(T.mul(T.log(predicted_probs_new), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list_new).to(self.device)
+                #L_new = -(T.mul(T.log(predicted_probs_new), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list_new).to(self.device)
+                L_new = -(T.mul(T.log(predicted_probs_new), self_p_list)).mean() 
                 KL_new = kl_div(predicted_a_list, predicted_a_list_new)
 
             L_improvement = L_new - L
@@ -215,15 +222,14 @@ class ILAgent():
         i = 0
         while not criterion((0.9 ** i) * max_step) and i < 10:
             i += 1
+        print('updated', i)
 
         batch_loss += L.detach().item()
 
-        self_a_list = T.LongTensor([a for self_s_a_list,_ in all_self_traj for s,a,_ in self_s_a_list]).to(self.device)
-        self_s_list = T.stack(([s for self_s_a_list,_ in all_self_traj for s,a,_ in self_s_a_list])).to(self.device)
-        self_p_list = T.tensor([(1-p) for self_s_a_list,p in all_self_traj for s,a,_ in self_s_a_list]).to(self.device)
         predicted_a_list = self.policy.forward(self_s_list).to(self.device)
         predicted_probs = predicted_a_list[range(predicted_a_list.shape[0]),self_a_list]
-        L = -(T.mul(T.log(predicted_probs), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list).to(self.device)
+        #L = -(T.mul(T.log(predicted_probs), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list).to(self.device)
+        L = -(T.mul(T.log(predicted_probs), self_p_list)).mean()
         print('L ', L)
         print("post update")  
         print(predicted_a_list, self_a_list, self_p_list)
@@ -242,6 +248,7 @@ class ILAgent():
         encoded_state = T.cat((encoded_state, answers_scores[:self.top_n]), dim=0)
         state = T.tensor(encoded_state, dtype=T.float).to(self.device)
         pp = self.policy.forward(state)
+        ##print("pp", pp)
         action = T.argmax(pp).item()
         #dist = Categorical(action)
         #sample_action = dist.sample().item()
