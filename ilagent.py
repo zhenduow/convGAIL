@@ -96,7 +96,7 @@ class ILAgent():
     The multi-objective Inverse reinforcement learning Agent for conversational search.
     This agent has multiple policies each represented by one <agent> object.
     '''
-    def __init__(self, n_action, observation_dim, top_n, lr, lrdc, weight_decay, max_d_kl, entropy_weight):
+    def __init__(self, n_action, observation_dim, top_n, lr, lrdc, weight_decay, max_d_kl, entropy_weight, pmax):
         self.lr = lr
         self.lrdc = lrdc
         self.weight_decay = weight_decay
@@ -111,6 +111,7 @@ class ILAgent():
         #self.params.append(self.entropy_weight)
         self.optimizer = optim.Adam(self.params, lr=self.lr, weight_decay = self.weight_decay)
         self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=self.lrdc)
+        self.pmax = pmax
     
     def save(self, path):
         T.save(self.policy.state_dict(), path)
@@ -171,11 +172,11 @@ class ILAgent():
 
         self_a_list = T.LongTensor([a for self_traj in all_self_traj for _,a,_ in self_traj]).to(self.device)
         self_s_list = T.stack(([s for self_traj in all_self_traj for s,_,_ in self_traj])).to(self.device)
-        self_p_list = T.tensor([(1-p) for self_traj in all_self_traj for _,_,p in self_traj]).to(self.device)
+        self_p_list = T.tensor([T.log(1-p+eps) for self_traj in all_self_traj for _,_,p in self_traj]).to(self.device)
         predicted_a_list = self.policy.forward(self_s_list).to(self.device)
         predicted_probs = predicted_a_list[range(predicted_a_list.shape[0]),self_a_list]
-        #L = -(T.mul(T.log(predicted_probs), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list).to(self.device)
-        L = -(T.mul(T.log(predicted_probs), self_p_list)).mean() 
+        L = -(T.mul(T.log(predicted_probs), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list).to(self.device)
+        #L = -(T.mul(T.log(predicted_probs), self_p_list)).mean() 
         print('L ', L)
         print("prior update")
         print(predicted_a_list, self_a_list, self_p_list)
@@ -207,8 +208,8 @@ class ILAgent():
                 predicted_a_list_new = self.policy.forward(self_s_list).to(self.device)
                 predicted_probs_new = predicted_a_list_new[range(predicted_a_list.shape[0]),self_a_list]
 
-                #L_new = -(T.mul(T.log(predicted_probs_new), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list_new).to(self.device)
-                L_new = -(T.mul(T.log(predicted_probs_new), self_p_list)).mean() 
+                L_new = -(T.mul(T.log(predicted_probs_new), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list_new).to(self.device)
+                #L_new = -(T.mul(T.log(predicted_probs_new), self_p_list)).mean() 
                 KL_new = kl_div(predicted_a_list, predicted_a_list_new)
 
             L_improvement = L_new - L
@@ -228,8 +229,8 @@ class ILAgent():
 
         predicted_a_list = self.policy.forward(self_s_list).to(self.device)
         predicted_probs = predicted_a_list[range(predicted_a_list.shape[0]),self_a_list]
-        #L = -(T.mul(T.log(predicted_probs), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list).to(self.device)
-        L = -(T.mul(T.log(predicted_probs), self_p_list)).mean()
+        L = -(T.mul(T.log(predicted_probs), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list).to(self.device)
+        #L = -(T.mul(T.log(predicted_probs), self_p_list)).mean()
         print('L ', L)
         print("post update")  
         print(predicted_a_list, self_a_list, self_p_list)
