@@ -76,14 +76,6 @@ def generate_batch_answer_candidates(batch, conversation_id, total_candidates):
     negatives = [answer for answer in batch['answers_pool'] if answer not in positives][:total_candidates - len(positives)] 
     return positives + negatives
 
-def compute_efficiency(reciprocal_rank, round):
-    '''
-    The intuition behind this metric is to split the range of 1/r and 1/(r+1), where 1/r = reciprocal_rank.
-    The efficiency score for 1 round maps to 1/r, and the efficiency score for infinite round maps to 1/(r+1).
-    In another word, quality is prioritized.
-    '''
-    return (float(reciprocal_rank) + float(reciprocal_rank)*float(reciprocal_rank) / float(round))/(float(reciprocal_rank) + 1)
-
 def create_rerankers(dataset_name, reranker_name):
     '''
     Create rerankers.
@@ -158,16 +150,29 @@ def compute_trajectory_ecrr(traj, continue_p):
     p *= 0 # if no answer is returned.
     return p
 
+def compute_self_trajectory_p(self_traj, a_traj, q_traj, p, best_ecrr):
+    self_traj_w_p = []
+    ecrr = 1
+    for i, (s,a,r) in enumerate(self_traj):
+        if a == 0:
+            ecrr *= r
+            self_traj_w_p.append((s, a, ecrr/(best_ecrr+1e-6)))
+        elif a == 1:
+            ecrr *= p ** r
+            _, best_future_ecrr = find_best_trajectory(a_traj[i+1:], q_traj[i+1:], p)
+            self_traj_w_p.append((s, a, ecrr*best_future_ecrr/(best_ecrr+1e-6)))
+
+    return self_traj_w_p
 
 def main(args):
     logging.getLogger().setLevel(logging.INFO)
     random.seed(2020)
     device = "cuda:0" if T.cuda.is_available() else "cpu"
     print(args)
-    output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cv'+ str(args.cv)+'_t'+str(args.user_tolerance)+'_p'+str(args.user_patience)+'_lr'+str(args.lr)+'_lrdc'+str(args.lrdc)+'_r'+str(args.cq_reward)+'_cas'+str(args.cascade_p), 'w')
-    train_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cv'+ str(args.cv)+'_t'+str(args.user_tolerance)+'_p'+str(args.user_patience)+'_lr'+str(args.lr)+'_lrdc'+str(args.lrdc)+'_r'+str(args.cq_reward)+'_cas'+str(args.cascade_p) + '_train', 'w')
-    val_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cv'+ str(args.cv)+'_t'+str(args.user_tolerance)+'_p'+str(args.user_patience)+'_lr'+str(args.lr)+'_lrdc'+str(args.lrdc)+'_r'+str(args.cq_reward)+'_cas'+str(args.cascade_p) + '_val', 'w')
-    test_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cv'+ str(args.cv)+'_t'+str(args.user_tolerance)+'_p'+str(args.user_patience)+'_lr'+str(args.lr)+'_lrdc'+str(args.lrdc)+'_r'+str(args.cq_reward)+'_cas'+str(args.cascade_p) + '_test', 'w')
+    output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cas'+str(args.cascade_p)+'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_pmax'+str(args.pmax), 'w')
+    train_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cas'+str(args.cascade_p) +'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_pmax'+str(args.pmax)+ '_train', 'w')
+    val_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cas'+str(args.cascade_p) +'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_pmax'+str(args.pmax)+ '_val', 'w')
+    test_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cas'+str(args.cascade_p)+'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_pmax'+str(args.pmax) + '_test', 'w')
 
 
     # load data
@@ -183,7 +188,7 @@ def main(args):
     # initialize agents
     agent = Agent(lr = 1e-4, input_dims = (3 + args.user_tolerance) * args.observation_dim + 1 + args.user_tolerance, top_k = args.user_tolerance, n_actions=args.n_action, gamma = 1 - args.cq_reward, weight_decay = args.weight_decay) # query, context, answer, and topn questions embedding + 1 answer score and topn question score
     base_agent = BaseAgent(lr = 1e-4, input_dims = 2 * args.observation_dim, n_actions = args.n_action, weight_decay = args.weight_decay)
-    ilagent = ILAgent(n_action = args.n_action, observation_dim = args.observation_dim, top_n = args.il_topn, lr= args.lr, lrdc=args.lrdc, weight_decay= args.weight_decay)
+    ilagent = ILAgent(n_action = args.n_action, observation_dim = args.observation_dim, top_n = args.il_topn, lr= args.lr, lrdc=args.lrdc, weight_decay= args.weight_decay, max_d_kl = args.max_d_kl, entropy_weight = args.entropy_weight, pmax=args.pmax)
     
     # initialize embedding model
     tokenizer = AutoTokenizer.from_pretrained('xlnet-base-cased')
@@ -351,7 +356,11 @@ def main(args):
                             train_ecrr.append(ecrr)
                             del ecrr
                         else:
-                            ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank < args.reranker_return_length:
+                                ecrr *= args.cascade_p**correct_question_rank
+                            else:
+                                train_ecrr.append(0)
+                                del ecrr
                     
                     if 'base_ecrr' in locals():
                         if base_action == 0:
@@ -359,7 +368,11 @@ def main(args):
                             train_base_ecrr.append(base_ecrr)
                             del base_ecrr
                         else:
-                            base_ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank < args.reranker_return_length:
+                                base_ecrr *= args.cascade_p**correct_question_rank
+                            else:
+                                train_base_ecrr.append(0)
+                                del base_ecrr
                     
                     if 'il_ecrr' in locals():
                         if il_action == 0:
@@ -367,7 +380,11 @@ def main(args):
                             train_il_ecrr.append(il_ecrr)
                             del il_ecrr
                         else:
-                            il_ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank < args.reranker_return_length:
+                                il_ecrr *= args.cascade_p**correct_question_rank
+                            else:
+                                train_il_ecrr.append(0)
+                                del il_ecrr
 
                     context = context_
                     n_round += 1
@@ -379,10 +396,7 @@ def main(args):
                 train_oracle_ecrr.append(best_ecrr)
                 avg_turns += best_answer_step
 
-                expert_traj = []
-                for step in range(best_answer_step-1):
-                    expert_traj.append((q_traj[step][0], 1))
-                expert_traj.append((a_traj[best_answer_step][0], 0))                
+                        
                 self_traj = []
                 # create self trajectories
                 for step in range(len(il_traj)):
@@ -391,9 +405,10 @@ def main(args):
                         break
                 
                 # add positive and self trajectory to batch
-                self_traj_ecrr = compute_trajectory_ecrr(self_traj, args.cascade_p)
-                all_self_traj.append((self_traj, self_traj_ecrr/(best_ecrr+1e-6)))
-                all_expert_traj.append(expert_traj)
+                self_traj_w_p = compute_self_trajectory_p(self_traj, a_traj, q_traj, args.cascade_p, best_ecrr)
+                #all_self_traj = []
+                all_self_traj.append(self_traj_w_p)
+                #batch_loss = ilagent.trpo_update(all_self_traj)
 
             # save memory per batch
             T.save(memory, args.dataset_name + '_experiments/embedding_cache/' + args.reranker_name + '/' + args.cv + '/train/memory.batchsave' + str(batch_serial))
@@ -446,7 +461,6 @@ def main(args):
         ## val
         val_scores, val_q0_scores, val_q1_scores, val_q2_scores, val_oracle_scores, val_base_scores, val_il_scores = [],[],[],[],[],[],[]
         val_worse, val_q0_worse, val_q1_worse, val_q2_worse, val_base_worse,val_il_worse = [],[],[],[],[],[]
-        val_efficiency, val_oracle_efficiency, val_base_efficiency, val_il_efficiency = [], [], [], []
         val_ecrr, val_q0_ecrr, val_q1_ecrr, val_q2_ecrr, val_oracle_ecrr, val_base_ecrr, val_il_ecrr = [],[],[],[],[],[],[]
         agent.epsilon = 0
         
@@ -471,7 +485,6 @@ def main(args):
                 stop, base_stop, il_stop = False,False,False
                 a_traj, q_traj, il_traj = [], [], []
                 ecrr, base_ecrr, il_ecrr = 1, 1, 1
-                cur_traj = [] # current conversation trajectory used for computing policy distribution
                 correct_question_rank = 0
                 output.write('-------- val batch %.0f conversation %.0f/%.0f --------\n' % (batch_serial, args.batch_size*(batch_serial) + conv_serial + 1, test_size))
                 # while not q_done:
@@ -507,7 +520,6 @@ def main(args):
 
                     context_, answer_reward, question_reward, correct_question_rank, q_done, good_question, patience_this_turn = user.update_state(val_id, context, questions, answers, use_top_k = max(args.user_tolerance - patience_used, 1))
                     patience_used = max(patience_used + patience_this_turn, args.user_tolerance)
-                    cur_traj.append((state, il_action,[answer_reward, correct_question_rank][il_action])) # update current conversation trajectory
                     output.write('act '+str(action)+' base act '+str(base_action)+' il act '+str(il_action)+' a reward '+str(answer_reward)+' q reward '+str(question_reward) +' cq rank '+str(correct_question_rank) +'\n')
                     val_output.write(str(i)+' '+str(val_id)+' '+str(n_round)+' '+str(action)+' '+str(base_action)+' '+str(il_action)+' '+str(answer_reward)+' '+str(correct_question_rank) +'\n')
 
@@ -538,7 +550,6 @@ def main(args):
                         if (action == 0 or (action == 1 and question_reward == args.cq_reward - 1)):
                             stop = True
                             val_scores.append(answer_reward if action == 0 else 0)
-                            val_efficiency.append(compute_efficiency(answer_reward, n_round + 1) if action ==0 else 0)
 
                     if not base_stop:
                         val_base_worse.append(1 if (base_action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
@@ -546,7 +557,6 @@ def main(args):
                         if (base_action == 0 or (base_action == 1 and question_reward == args.cq_reward - 1)):
                             base_stop = True
                             val_base_scores.append(answer_reward if base_action == 0 else 0)
-                            val_base_efficiency.append(compute_efficiency(answer_reward, n_round + 1) if base_action ==0 else 0)
 
                     if not il_stop:
                         val_il_worse.append(1 if (il_action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
@@ -554,7 +564,6 @@ def main(args):
                         if (il_action == 0 or (il_action == 1 and question_reward == args.cq_reward - 1)):
                             il_stop = True
                             val_il_scores.append(answer_reward if il_action == 0 else 0)
-                            val_il_efficiency.append(compute_efficiency(answer_reward, n_round + 1) if il_action ==0 else 0)
 
                     # baseline models evaluations
                     if n_round == 0:
@@ -588,7 +597,11 @@ def main(args):
                             val_ecrr.append(ecrr)
                             del ecrr
                         else:
-                            ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank < args.reranker_return_length:
+                                ecrr *= args.cascade_p**correct_question_rank
+                            else:
+                                val_ecrr.append(0)
+                                del ecrr
                     
                     if 'base_ecrr' in locals():
                         if base_action == 0:
@@ -596,7 +609,11 @@ def main(args):
                             val_base_ecrr.append(base_ecrr)
                             del base_ecrr
                         else:
-                            base_ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank < args.reranker_return_length:
+                                base_ecrr *= args.cascade_p**correct_question_rank
+                            else:
+                                val_base_ecrr.append(0)
+                                del base_ecrr
                     
                     if 'il_ecrr' in locals():
                         if il_action == 0:
@@ -604,7 +621,11 @@ def main(args):
                             val_il_ecrr.append(il_ecrr)
                             del il_ecrr
                         else:
-                            il_ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank < args.reranker_return_length:
+                                il_ecrr *= args.cascade_p**correct_question_rank
+                            else:
+                                val_il_ecrr.append(0)
+                                del il_ecrr
 
                     n_round += 1
                     context = context_
@@ -622,20 +643,20 @@ def main(args):
 
 
         output.write("Val epoch " + str(i)+'\n')
-        output.write("risk\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate %.6f\n" % 
-            (np.mean([1 if score == 1 else 0 for score in val_scores]), np.mean(val_scores), np.mean(val_ecrr), np.mean(val_efficiency), np.mean(val_worse)))
-        output.write("q0\t\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate %.6f\n" % 
-            (np.mean([1 if score == 1 else 0 for score in val_q0_scores]), np.mean(val_q0_scores), np.mean(val_q0_ecrr), np.mean(val_q0_scores), np.mean(val_q0_worse)))
-        output.write("q1\t\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate %.6f\n" % 
-            (np.mean([1 if score == 1 else 0 for score in val_q1_scores]), np.mean(val_q1_scores), np.mean(val_q1_ecrr), np.mean([compute_efficiency(s, 2) for s in val_q1_scores]), np.mean(val_q1_worse)))
-        output.write("q2\t\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate %.6f\n" % 
-            (np.mean([1 if score == 1 else 0 for score in val_q2_scores]), np.mean(val_q2_scores), np.mean(val_q2_ecrr), np.mean([compute_efficiency(s, 3) for s in val_q2_scores]), np.mean(val_q2_worse)))
-        output.write("base\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate %.6f\n" % 
-            (np.mean([1 if score == 1 else 0 for score in val_base_scores]), np.mean(val_base_scores), np.mean(val_base_ecrr), np.mean(val_base_efficiency), np.mean(val_base_worse)))
-        output.write("il\t\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate %.6f\n" % 
-            (np.mean([1 if score == 1 else 0 for score in val_il_scores]), np.mean(val_il_scores), np.mean(val_il_ecrr), np.mean(val_il_efficiency), np.mean(val_il_worse)))
-        output.write("oracle\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate 0\n" % 
-            (np.mean([1 if score == 1 else 0 for score in val_oracle_scores]), np.mean(val_oracle_scores), np.mean(val_oracle_ecrr), np.mean(val_oracle_efficiency)))
+        output.write("risk\tacc %.6f, mrr %.6f, ecrr %.6f, err rate %.6f\n" % 
+            (np.mean([1 if score == 1 else 0 for score in val_scores]), np.mean(val_scores), np.mean(val_ecrr), np.mean(val_worse)))
+        output.write("q0\t\tacc %.6f, mrr %.6f, ecrr %.6f, err rate %.6f\n" % 
+            (np.mean([1 if score == 1 else 0 for score in val_q0_scores]), np.mean(val_q0_scores), np.mean(val_q0_ecrr), np.mean(val_q0_worse)))
+        output.write("q1\t\tacc %.6f, mrr %.6f, ecrr %.6f, err rate %.6f\n" % 
+            (np.mean([1 if score == 1 else 0 for score in val_q1_scores]), np.mean(val_q1_scores), np.mean(val_q1_ecrr), np.mean(val_q1_worse)))
+        output.write("q2\t\tacc %.6f, mrr %.6f, ecrr %.6f, err rate %.6f\n" % 
+            (np.mean([1 if score == 1 else 0 for score in val_q2_scores]), np.mean(val_q2_scores), np.mean(val_q2_ecrr), np.mean(val_q2_worse)))
+        output.write("base\tacc %.6f, mrr %.6f, ecrr %.6f, err rate %.6f\n" % 
+            (np.mean([1 if score == 1 else 0 for score in val_base_scores]), np.mean(val_base_scores), np.mean(val_base_ecrr),  np.mean(val_base_worse)))
+        output.write("il\t\tacc %.6f, mrr %.6f, ecrr %.6f, err rate %.6f\n" % 
+            (np.mean([1 if score == 1 else 0 for score in val_il_scores]), np.mean(val_il_scores), np.mean(val_il_ecrr),  np.mean(val_il_worse)))
+        output.write("oracle\tacc %.6f, mrr %.6f, ecrr %.6f, err rate 0\n" % 
+            (np.mean([1 if score == 1 else 0 for score in val_oracle_scores]), np.mean(val_oracle_scores), np.mean(val_oracle_ecrr)))
         
         val_il_mrr_hist.append(np.mean(val_il_scores))
         val_il_ecrr_hist.append(np.mean(val_il_ecrr))
@@ -650,7 +671,6 @@ def main(args):
         ## test 
         test_scores, test_q0_scores, test_q1_scores, test_q2_scores, test_oracle_scores, test_base_scores, test_il_scores = [],[],[],[],[],[],[]
         test_worse, test_q0_worse, test_q1_worse,test_q2_worse, test_base_worse, test_il_worse = [],[],[],[],[],[]
-        test_efficiency, test_oracle_efficiency, test_base_efficiency, test_il_efficiency = [], [], [], []
         test_ecrr, test_q0_ecrr, test_q1_ecrr, test_q2_ecrr, test_oracle_ecrr, test_base_ecrr, test_il_ecrr = [],[],[],[],[],[],[]
         agent.epsilon= 0
         
@@ -675,7 +695,6 @@ def main(args):
                 stop, base_stop, il_stop = False,False,False
                 ecrr, base_ecrr, il_ecrr = 1, 1, 1
                 a_traj, q_traj, il_traj = [], [], []
-                cur_traj = []
                 correct_question_rank = 0
                 output.write('-------- test batch %.0f conversation %.0f/%.0f --------\n' % (batch_serial, args.batch_size*(batch_serial) + conv_serial + 1, test_size))
                 # while not q_done:
@@ -709,13 +728,13 @@ def main(args):
                     context_, answer_reward, question_reward, correct_question_rank, q_done, good_question, patience_this_turn = user.update_state(test_id, context, questions, answers, use_top_k = max(args.user_tolerance - patience_used, 1))
                     patience_used = max(patience_used + patience_this_turn, args.user_tolerance)
                     
-                    cur_traj.append((state, il_action,[answer_reward, correct_question_rank][il_action])) # update current conversation trajectory
                     output.write('act '+str(action)+' base act '+str(base_action)+' il act '+str(il_action)+' a reward '+str(answer_reward)+' q reward '+str(question_reward) +' cq rank '+str(correct_question_rank) +'\n')
                     test_output.write(str(i)+' '+str(test_id)+' '+str(n_round)+' '+str(action)+' '+str(base_action)+' '+str(il_action)+' '+str(answer_reward)+' '+str(correct_question_rank) +'\n')
 
                     a_traj.append((state, answer_reward))
                     q_traj.append((state, correct_question_rank))
-                    il_traj.append((state, il_action,[answer_reward, correct_question_rank][il_action]))
+                    il_traj.append((state, il_action, [answer_reward, correct_question_rank][il_action]))
+                    #print(answer_reward, correct_question_rank, il_action)
 
                     if n_round >= args.user_patience:
                         q_done = True
@@ -739,7 +758,6 @@ def main(args):
                         if (action == 0 or (action == 1 and question_reward == args.cq_reward - 1)):
                             stop = True
                             test_scores.append(answer_reward if action == 0 else 0)
-                            test_efficiency.append(compute_efficiency(answer_reward, n_round + 1) if action ==0 else 0)
 
                     if not base_stop:
                         test_base_worse.append(1 if (base_action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
@@ -747,7 +765,6 @@ def main(args):
                         if (base_action == 0 or (base_action == 1 and question_reward == args.cq_reward - 1)):
                             base_stop = True
                             test_base_scores.append(answer_reward if base_action == 0 else 0)
-                            test_base_efficiency.append(compute_efficiency(answer_reward, n_round + 1) if action ==0 else 0)
                     
                     if not il_stop:
                         test_il_worse.append(1 if (il_action == 0 and answer_reward < float(1/args.user_tolerance) and question_reward == args.cq_reward) \
@@ -755,7 +772,6 @@ def main(args):
                         if (il_action == 0 or (il_action == 1 and question_reward == args.cq_reward - 1)):
                             il_stop = True
                             test_il_scores.append(answer_reward if il_action == 0 else 0)
-                            test_il_efficiency.append(compute_efficiency(answer_reward, n_round + 1) if action ==0 else 0)
 
                     # baseline models evaluations
                     if n_round == 0:
@@ -789,7 +805,11 @@ def main(args):
                             test_ecrr.append(ecrr)
                             del ecrr
                         else:
-                            ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank < args.reranker_return_length:
+                                ecrr *= args.cascade_p**correct_question_rank
+                            else:
+                                test_ecrr.append(0)
+                                del ecrr
                     
                     if 'base_ecrr' in locals():
                         if base_action == 0:
@@ -797,7 +817,11 @@ def main(args):
                             test_base_ecrr.append(base_ecrr)
                             del base_ecrr
                         else:
-                            base_ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank < args.reranker_return_length:
+                                base_ecrr *= args.cascade_p**correct_question_rank
+                            else:
+                                test_base_ecrr.append(0)
+                                del base_ecrr
                     
                     if 'il_ecrr' in locals():
                         if il_action == 0:
@@ -805,7 +829,11 @@ def main(args):
                             test_il_ecrr.append(il_ecrr)
                             del il_ecrr
                         else:
-                            il_ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank < args.reranker_return_length:
+                                il_ecrr *= args.cascade_p**correct_question_rank
+                            else:
+                                test_il_ecrr.append(0)
+                                del il_ecrr
 
 
                     n_round += 1
@@ -816,6 +844,7 @@ def main(args):
                 test_oracle_scores.append(best_answer_reward)
                 test_oracle_ecrr.append(best_ecrr)
 
+
             # save batch cache
             T.save(memory, args.dataset_name + '_experiments/embedding_cache/' + args.reranker_name + '/' + args.cv + '/test/memory.batchsave' + str(batch_serial))
             del memory
@@ -823,20 +852,20 @@ def main(args):
 
 
         output.write("Test epoch " + str(i)+'\n')
-        output.write("risk\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate %.6f\n" % 
-            (np.mean([1 if score == 1 else 0 for score in test_scores]), np.mean(test_scores), np.mean(test_ecrr), np.mean(test_efficiency), np.mean(test_worse)))
-        output.write("q0\t\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate %.6f\n" % 
-            (np.mean([1 if score == 1 else 0 for score in test_q0_scores]), np.mean(test_q0_scores), np.mean(test_q0_ecrr), np.mean(test_q0_worse), np.mean(test_q0_worse)))
-        output.write("q1\t\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate %.6f\n" % 
-            (np.mean([1 if score == 1 else 0 for score in test_q1_scores]), np.mean(test_q1_scores), np.mean(test_q1_ecrr), np.mean([compute_efficiency(s, 2) for s in val_q1_scores]), np.mean(test_q1_worse)))
-        output.write("q2\t\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate %.6f\n" % 
-            (np.mean([1 if score == 1 else 0 for score in test_q2_scores]), np.mean(test_q2_scores), np.mean(test_q2_ecrr), np.mean([compute_efficiency(s, 3) for s in val_q1_scores]), np.mean(test_q2_worse)))
-        output.write("base\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate %.6f\n" % 
-            (np.mean([1 if score == 1 else 0 for score in test_base_scores]), np.mean(test_base_scores), np.mean(test_base_ecrr), np.mean(test_base_efficiency), np.mean(test_base_worse)))
-        output.write("il\t\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate %.6f\n" % 
-            (np.mean([1 if score == 1 else 0 for score in test_il_scores]), np.mean(test_il_scores), np.mean(test_il_ecrr), np.mean(test_il_efficiency), np.mean(test_il_worse)))   
-        output.write("oracle\tacc %.6f, mrr %.6f, ecrr %.6f, efficiency %.6f, err rate 0\n" % 
-            (np.mean([1 if score == 1 else 0 for score in test_oracle_scores]), np.mean(test_oracle_scores), np.mean(test_oracle_ecrr), np.mean(test_oracle_efficiency)))
+        output.write("risk\tacc %.6f, mrr %.6f, ecrr %.6f, err rate %.6f\n" % 
+            (np.mean([1 if score == 1 else 0 for score in test_scores]), np.mean(test_scores), np.mean(test_ecrr), np.mean(test_worse)))
+        output.write("q0\t\tacc %.6f, mrr %.6f, ecrr %.6f, err rate %.6f\n" % 
+            (np.mean([1 if score == 1 else 0 for score in test_q0_scores]), np.mean(test_q0_scores), np.mean(test_q0_ecrr), np.mean(test_q0_worse)))
+        output.write("q1\t\tacc %.6f, mrr %.6f, ecrr %.6f, err rate %.6f\n" % 
+            (np.mean([1 if score == 1 else 0 for score in test_q1_scores]), np.mean(test_q1_scores), np.mean(test_q1_ecrr), np.mean(test_q1_worse)))
+        output.write("q2\t\tacc %.6f, mrr %.6f, ecrr %.6f, err rate %.6f\n" % 
+            (np.mean([1 if score == 1 else 0 for score in test_q2_scores]), np.mean(test_q2_scores), np.mean(test_q2_ecrr), np.mean(test_q2_worse)))
+        output.write("base\tacc %.6f, mrr %.6f, ecrr %.6f, err rate %.6f\n" % 
+            (np.mean([1 if score == 1 else 0 for score in test_base_scores]), np.mean(test_base_scores), np.mean(test_base_ecrr), np.mean(test_base_worse)))
+        output.write("il\t\tacc %.6f, mrr %.6f, ecrr %.6f, err rate %.6f\n" % 
+            (np.mean([1 if score == 1 else 0 for score in test_il_scores]), np.mean(test_il_scores), np.mean(test_il_ecrr), np.mean(test_il_worse)))   
+        output.write("oracle\tacc %.6f, mrr %.6f, ecrr %.6f, err rate 0\n" % 
+            (np.mean([1 if score == 1 else 0 for score in test_oracle_scores]), np.mean(test_oracle_scores), np.mean(test_oracle_ecrr)))
 
         test_il_mrr_hist.append(np.mean(test_il_scores))
         test_il_ecrr_hist.append(np.mean(test_il_ecrr))
@@ -874,6 +903,9 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint_base', type = str, default = '')
     parser.add_argument('--checkpoint_il', type = str, default = '')
     parser.add_argument('--load_checkpoint', type = bool, default = False)
+    parser.add_argument('--max_d_kl', type = float, default = 0.01)
+    parser.add_argument('--entropy_weight', type = float, default = 1e-3)
+    parser.add_argument('--pmax', type = float, default = 0.8)
 
     args = parser.parse_args()
     main(args)
