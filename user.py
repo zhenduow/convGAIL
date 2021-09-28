@@ -102,13 +102,13 @@ class User:
                     break
         if 0 <= correct_question_id <= (use_top_k - 1):
             question_reward = self.cq_reward
-            context_ = context + ' [SEP] ' + top_n_question[correct_question_id] + ' [SEP] ' + user_response_text
             patience_used = correct_question_id
         else:
             # the agent asks a bad question  
             question_reward = self.cq_penalty
             done = True
-            context_ = context + ' [SEP] ' + top_n_question[0] + ' [SEP] ' + 'This question is not relevant.'
+            
+        context_ = context + ' [SEP] ' + top_n_question[correct_question_id] + ' [SEP] ' + user_response_text
         correct_question = top_n_question[correct_question_id]
         if correct_question_id < 0:
             correct_question_id = 99
