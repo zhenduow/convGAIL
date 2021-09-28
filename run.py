@@ -103,6 +103,8 @@ def initialize_dirs(dataset_name, reranker_name, cv):
     '''
     Create folders for saving cache, checkpoints, and logs.
     '''
+    if not os.path.exists(dataset_name + '_experiments/'):
+        os.makedirs(dataset_name + '_experiments/')
     if not os.path.exists(dataset_name + '_experiments/checkpoints/'):
         os.makedirs(dataset_name + '_experiments/checkpoints/')
     if not os.path.exists(dataset_name + '_experiments/embedding_cache/'):
@@ -169,6 +171,10 @@ def main(args):
     random.seed(2020)
     device = "cuda:0" if T.cuda.is_available() else "cpu"
     print(args)
+
+    # initialize log directories
+    initialize_dirs(args.dataset_name, args.reranker_name, args.cv)
+
     output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cas'+str(args.cascade_p)+'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_pmax'+str(args.pmax), 'w')
     train_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cas'+str(args.cascade_p) +'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_pmax'+str(args.pmax)+ '_train', 'w')
     val_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cas'+str(args.cascade_p) +'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_pmax'+str(args.pmax)+ '_val', 'w')
@@ -194,8 +200,6 @@ def main(args):
     tokenizer = AutoTokenizer.from_pretrained('xlnet-base-cased')
     embedding_model = AutoModel.from_pretrained('xlnet-base-cased').to(device)
 
-    # initialize log directories
-    initialize_dirs(args.dataset_name, args.reranker_name, args.cv)
     
     if args.load_checkpoint == True:
         #agent.load(args.dataset_name + '_experiments/checkpoints/' + args.checkpoint)
