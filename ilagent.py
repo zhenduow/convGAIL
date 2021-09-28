@@ -168,11 +168,11 @@ class ILAgent():
         '''
         # update policy
         batch_loss = 0
-        eps = 1e-4
+        eps = 1e-2
 
         self_a_list = T.LongTensor([a for self_traj in all_self_traj for _,a,_ in self_traj]).to(self.device)
         self_s_list = T.stack(([s for self_traj in all_self_traj for s,_,_ in self_traj])).to(self.device)
-        self_p_list = T.tensor([T.log(1-p+eps) for self_traj in all_self_traj for _,_,p in self_traj]).to(self.device)
+        self_p_list = T.tensor([np.log(1-p+eps) for self_traj in all_self_traj for _,_,p in self_traj]).to(self.device)
         predicted_a_list = self.policy.forward(self_s_list).to(self.device)
         predicted_probs = predicted_a_list[range(predicted_a_list.shape[0]),self_a_list]
         L = -(T.mul(T.log(predicted_probs), self_p_list)).mean() + self.entropy_weight * entropy_e(predicted_a_list).to(self.device)
