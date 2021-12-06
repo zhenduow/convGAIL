@@ -111,5 +111,5 @@ class User:
         context_ = context + ' [SEP] ' + top_n_question[correct_question_id] + ' [SEP] ' + user_response_text
         correct_question = top_n_question[correct_question_id]
         if correct_question_id < 0:
-            correct_question_id = 99
+            correct_question_id = 100
         return context_, answer_reward, question_reward, correct_question_id, done, correct_question, patience_used
