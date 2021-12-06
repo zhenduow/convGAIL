@@ -1,14 +1,13 @@
 from user import User
 from dataset import ConversationDataset
 from agent import Agent, BaseAgent
-from ilagent import ILAgent
+from ilagent import ILAgent, GAILAgent
 import logging
 import numpy as np
 import random
 import os
 import torch as T
 from transformers import AutoTokenizer, AutoModel
-from scipy.special import softmax
 from parlai.scripts.interactive import Interactive, rerank
 from copy import deepcopy
 import argparse
@@ -49,8 +48,8 @@ def save_to_memory(query, context, memory, questions, answers, questions_scores,
     memory[query][context] = {}
     with T.no_grad():
         memory[query][context]['embedding'] = T.squeeze(embedding_model(T.tensor([tokenizer.encode(context, add_special_tokens=True)]).to(device))[0])[0].detach().cpu()
-        memory[query][context]['questions_embeddings'] = [T.squeeze(embedding_model(T.tensor([tokenizer.encode(questions[i], add_special_tokens=True)]).to(device))[0])[0].detach().cpu() for i in range(3)] # hard coding max tolerance to save memory
-        memory[query][context]['answers_embeddings'] = [T.squeeze(embedding_model(T.tensor([tokenizer.encode(answers[0], add_special_tokens=True)]).to(device))[0])[0].detach().cpu()]
+        memory[query][context]['questions_embeddings'] = [T.squeeze(embedding_model(T.tensor([tokenizer.encode(questions[i], add_special_tokens=True)]).to(device))[0])[0].detach().cpu() for i in range(10)] # hard coding max tolerance to save memory
+        memory[query][context]['answers_embeddings'] = [T.squeeze(embedding_model(T.tensor([tokenizer.encode(answers[i], add_special_tokens=True)]).to(device))[0])[0].detach().cpu() for i in range(10)]
         memory[query][context]['questions'] = questions
         memory[query][context]['answers'] = answers
         memory[query][context]['questions_scores'] = T.tensor(questions_scores).detach().cpu()
@@ -128,8 +127,8 @@ def initialize_dirs(dataset_name, reranker_name, cv):
 def find_best_trajectory(answer_traj, question_traj, p):
     '''
     Find the best conversation trajectory given all the answer rank and question rank.
-    answer_traj is a list of (state, action, reward) tuples.
-    question_traj is a list of (state, action, correct question rank) tuples.
+    answer_traj is a list of ((state, action), reward) tuples.
+    question_traj is a list of ((state, action), correct question rank) tuples.
     '''
     best_ecrr, best_step = 0, 0
     cumulative_ecrr = 1
@@ -153,6 +152,9 @@ def compute_trajectory_ecrr(traj, continue_p):
     return p
 
 def compute_self_trajectory_p(self_traj, a_traj, q_traj, p, best_ecrr):
+    '''
+    Compute the normalized trajectory ecrr.
+    '''
     self_traj_w_p = []
     ecrr = 1
     for i, (s,a,r) in enumerate(self_traj):
@@ -166,6 +168,53 @@ def compute_self_trajectory_p(self_traj, a_traj, q_traj, p, best_ecrr):
 
     return self_traj_w_p
 
+def find_least_effort(answer_traj, question_traj):
+    '''
+    Find the conversation trajectory with the least user effort given all the answer rank and question rank.
+    answer_traj is a list of (state, action, reward) tuples.
+    question_traj is a list of (state, action, correct question rank) tuples.
+    '''
+    least_effort, best_step = 0, 0
+    cumulative_effort = 0
+    assert len(answer_traj) == len(question_traj)
+    for step in range(len(answer_traj)):
+        if cumulative_effort + int(1/answer_traj[step][1]) < least_effort:
+            least_effort = cumulative_effort + int(1/answer_traj[step][1])
+            best_step = step
+        cumulative_effort += (question_traj[step][1] + 1)
+    
+    print(answer_traj, question_traj)
+    print(best_step, least_effort)
+    return best_step, least_effort
+
+def compute_trajectory_effort(traj):
+    eff = 0
+    for s, a, r in traj:
+        if a == 0:
+            p += int(1/r)
+            return p
+        else:
+            p += (r+1)
+    p += 10000 # if no answer is returned.
+    return p
+
+def compute_self_trajectory_normalized_effort(self_traj, a_traj, q_traj, least_effort):
+    '''
+    Compute the normalized trajectory effort.
+    '''
+    self_traj_w_p = []
+    effort = 0
+    for i, (s,a,r) in enumerate(self_traj):
+        if a == 0:
+            effort += int(1/r)
+            self_traj_w_p.append((s, a, least_effort/effort))
+        elif a == 1:
+            effort += (r+1)
+            _, least_future_effort = find_least_effort(a_traj[i+1:], q_traj[i+1:])
+            self_traj_w_p.append((s, a, least_effort/(effort+least_future_effort)))
+
+    return self_traj_w_p
+
 def main(args):
     logging.getLogger().setLevel(logging.INFO)
     random.seed(2020)
@@ -175,10 +224,10 @@ def main(args):
     # initialize log directories
     initialize_dirs(args.dataset_name, args.reranker_name, args.cv)
 
-    output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cas'+str(args.cascade_p)+'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_pmax'+str(args.pmax), 'w')
-    train_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cas'+str(args.cascade_p) +'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_pmax'+str(args.pmax)+ '_train', 'w')
-    val_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cas'+str(args.cascade_p) +'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_pmax'+str(args.pmax)+ '_val', 'w')
-    test_output = open(args.dataset_name+'_experiments/'+args.reranker_name +'_cas'+str(args.cascade_p)+'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_pmax'+str(args.pmax) + '_test', 'w')
+    output = open(args.dataset_name+'_experiments/'+ 'cv' + args.cv + '_' + args.gan_name + '_r' + str(args.cq_reward) +'_cas'+str(args.cascade_p)+'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_discratio'+str(args.disc_train_ratio), 'w')
+    #train_output = open(args.dataset_name+'_experiments/'+args.reranker_name + '_r' + str(args.cq_reward) +'_cas'+str(args.cascade_p) +'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_discratio'+str(args.disc_train_ratio)+ '_train', 'w')
+    #val_output = open(args.dataset_name+'_experiments/'+args.reranker_name + '_r' + str(args.cq_reward)+'_cas'+str(args.cascade_p) +'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_discratio'+str(args.disc_train_ratio)+ '_val', 'w')
+    #test_output = open(args.dataset_name+'_experiments/'+args.reranker_name + '_r' + str(args.cq_reward)+'_cas'+str(args.cascade_p)+'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_discratio'+str(args.disc_train_ratio) + '_test', 'w')
 
 
     # load data
@@ -194,7 +243,7 @@ def main(args):
     # initialize agents
     agent = Agent(lr = 1e-4, input_dims = (3 + args.user_tolerance) * args.observation_dim + 1 + args.user_tolerance, top_k = args.user_tolerance, n_actions=args.n_action, gamma = 1 - args.cq_reward, weight_decay = args.weight_decay) # query, context, answer, and topn questions embedding + 1 answer score and topn question score
     base_agent = BaseAgent(lr = 1e-4, input_dims = 2 * args.observation_dim, n_actions = args.n_action, weight_decay = args.weight_decay)
-    ilagent = ILAgent(n_action = args.n_action, observation_dim = args.observation_dim, top_n = args.il_topn, lr= args.lr, lrdc=args.lrdc, weight_decay= args.weight_decay, max_d_kl = args.max_d_kl, entropy_weight = args.entropy_weight, pmax=args.pmax)
+    ilagent = GAILAgent(n_action = args.n_action, observation_dim = args.observation_dim, top_n = args.il_topn, lr= args.lr, lrdc=args.lrdc, weight_decay= args.weight_decay, max_d_kl = args.max_d_kl, entropy_weight = args.entropy_weight, pmax=args.pmax, disc_weight_clip = args.disc_weight_clip, policy_weight_clip = args.policy_weight_clip, gan_name = args.gan_name)
     
     # initialize embedding model
     tokenizer = AutoTokenizer.from_pretrained('xlnet-base-cased')
@@ -210,11 +259,12 @@ def main(args):
     train_il_ecrr_hist, train_il_loss_hist = [],[]
     val_il_mrr_hist, val_il_ecrr_hist = [],[]
     test_il_mrr_hist, test_il_ecrr_hist = [],[]
-    for i in range(args.train_iter):
+    for i in range(args.max_iter):
         train_scores, train_q0_scores, train_q1_scores, train_q2_scores, train_oracle_scores, train_base_scores, train_il_scores  = [],[],[],[],[],[],[]
         train_worse, train_q0_worse, train_q1_worse, train_q2_worse, train_base_worse, train_il_worse = [],[],[],[],[],[]
         train_ecrr, train_q0_ecrr, train_q1_ecrr, train_q2_ecrr, train_oracle_ecrr, train_base_ecrr, train_il_ecrr = [],[],[],[],[],[],[]
         il_loss = 0
+        disc_loss = 0
         avg_turns = 0
         for batch_serial, batch in enumerate(train_dataset.batches):
             all_expert_traj = [] # all conversation trajectories used for il
@@ -273,7 +323,7 @@ def main(args):
                     context_, answer_reward, question_reward, correct_question_rank, q_done, good_question, patience_this_turn = user.update_state(train_id, context, questions, answers, use_top_k = max(args.user_tolerance - patience_used, 1))
                     patience_used = max(patience_used + patience_this_turn, args.user_tolerance)
                     output.write('act '+str(action)+' base act '+str(base_action)+' il act '+str(il_action)+' a reward '+str(answer_reward)+' q reward '+str(question_reward) +' cq rank '+str(correct_question_rank) +'\n')
-                    train_output.write(str(i)+' '+str(train_id)+' '+str(n_round)+' '+str(action)+' '+str(base_action)+' '+str(il_action)+' '+str(answer_reward)+' '+str(correct_question_rank) +'\n')
+                    #train_output.write(str(i)+' '+str(train_id)+' '+str(n_round)+' '+str(action)+' '+str(base_action)+' '+str(il_action)+' '+str(answer_reward)+' '+str(correct_question_rank) +'\n')
                     a_traj.append((state, answer_reward))
                     q_traj.append((state, correct_question_rank))
                     il_traj.append((state, il_action,[answer_reward, correct_question_rank][il_action]))
@@ -355,51 +405,56 @@ def main(args):
 
                     # ecrr evaluation
                     if 'ecrr' in locals():
-                        if action == 0:
+                        if action == 1:
+                            ecrr *= args.cascade_p**correct_question_rank
+                            if  correct_question_rank >= args.reranker_return_length:
+                                ecrr *= answer_reward
+                                train_ecrr.append(ecrr)
+                                del ecrr
+                        else:
                             ecrr *= answer_reward
                             train_ecrr.append(ecrr)
                             del ecrr
-                        else:
-                            if correct_question_rank < args.reranker_return_length:
-                                ecrr *= args.cascade_p**correct_question_rank
-                            else:
-                                train_ecrr.append(0)
-                                del ecrr
                     
                     if 'base_ecrr' in locals():
-                        if base_action == 0:
+                        if base_action == 1:
+                            base_ecrr *= args.cascade_p**correct_question_rank
+                            if  correct_question_rank >=  args.reranker_return_length:
+                                base_ecrr *= answer_reward
+                                train_base_ecrr.append(base_ecrr)
+                                del base_ecrr
+                        else:
                             base_ecrr *= answer_reward
                             train_base_ecrr.append(base_ecrr)
                             del base_ecrr
-                        else:
-                            if correct_question_rank < args.reranker_return_length:
-                                base_ecrr *= args.cascade_p**correct_question_rank
-                            else:
-                                train_base_ecrr.append(0)
-                                del base_ecrr
                     
                     if 'il_ecrr' in locals():
-                        if il_action == 0:
+                        if il_action == 1:
+                            il_ecrr *= args.cascade_p**correct_question_rank
+                            if  correct_question_rank >= args.reranker_return_length:
+                                il_ecrr *= answer_reward
+                                train_il_ecrr.append(il_ecrr)
+                                del il_ecrr
+                        else:
                             il_ecrr *= answer_reward
                             train_il_ecrr.append(il_ecrr)
                             del il_ecrr
-                        else:
-                            if correct_question_rank < args.reranker_return_length:
-                                il_ecrr *= args.cascade_p**correct_question_rank
-                            else:
-                                train_il_ecrr.append(0)
-                                del il_ecrr
 
                     context = context_
                     n_round += 1
                 
-                # find the optimal trajectory
+                # find the optimal trajectory using ecrr
                 best_answer_step, best_ecrr = find_best_trajectory(a_traj, q_traj, args.cascade_p)
                 best_answer_reward = a_traj[best_answer_step][1]
                 train_oracle_scores.append(best_answer_reward)
                 train_oracle_ecrr.append(best_ecrr)
                 avg_turns += best_answer_step
 
+                expert_traj = []
+                for step in range(best_answer_step):
+                    expert_traj.append((q_traj[step][0], 1))
+                expert_traj.append((a_traj[best_answer_step][0], 0))
+                all_expert_traj.append(expert_traj)
                         
                 self_traj = []
                 # create self trajectories
@@ -410,17 +465,21 @@ def main(args):
                 
                 # add positive and self trajectory to batch
                 self_traj_w_p = compute_self_trajectory_p(self_traj, a_traj, q_traj, args.cascade_p, best_ecrr)
-                #all_self_traj = []
                 all_self_traj.append(self_traj_w_p)
-                #batch_loss = ilagent.trpo_update(all_self_traj)
+                '''
+                d_loss, batch_loss = ilagent.gail_update([expert_traj], [self_traj_w_p], bool((batch_serial) % args.disc_train_ratio == 0), d_pretrain = bool(i < 1))
+                il_loss += batch_loss
+                disc_loss += d_loss
+                '''
 
             # save memory per batch
             T.save(memory, args.dataset_name + '_experiments/embedding_cache/' + args.reranker_name + '/' + args.cv + '/train/memory.batchsave' + str(batch_serial))
             del memory
             
-            #batch_loss = ilagent.gail_step(all_self_traj)
-            batch_loss = ilagent.trpo_update(all_self_traj)
+            d_loss, batch_loss = ilagent.gail_update(all_expert_traj, all_self_traj, disc_train_ratio = args.disc_train_ratio, epoch = i)
+            #d_loss, batch_loss = ilagent.ecrr_update(all_expert_traj, all_self_traj)
             il_loss += batch_loss
+            disc_loss += d_loss
             
             T.cuda.empty_cache()
 
@@ -441,9 +500,11 @@ def main(args):
             (np.mean([1 if score == 1 else 0 for score in train_il_scores]), np.mean(train_il_scores), np.mean(train_il_ecrr), np.mean(train_il_worse)))
         output.write("oracle\tacc %.6f, mrr %.6f, ecrr %.6f, err rate 0\n" % 
             (np.mean([1 if score == 1 else 0 for score in train_oracle_scores]), np.mean(train_oracle_scores), np.mean(train_oracle_ecrr)))
+        
 
         output.write("avg loss " + str(np.mean(agent.loss_history)) + '\n')
         output.write("il loss " + str(il_loss) + '\n')
+        output.write("disc loss " + str(disc_loss) + '\n')
         output.write("avg cq "+str(avg_turns/(args.batch_size*len(train_dataset.batches)))+'\n')
 
         # save checkpoint
@@ -460,7 +521,7 @@ def main(args):
         plt.plot(X, train_il_loss_hist, label="train_loss")
         plt.legend()
 
-        plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_train.png')
+        #plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_train.png')
 
         ## val
         val_scores, val_q0_scores, val_q1_scores, val_q2_scores, val_oracle_scores, val_base_scores, val_il_scores = [],[],[],[],[],[],[]
@@ -520,12 +581,12 @@ def main(args):
                     state, action = agent.choose_action(query_embedding, context_embedding, questions_embeddings, answers_embeddings, questions_scores, answers_scores)
                     base_action = base_agent.choose_action(query_embedding, context_embedding)
                     # convil
-                    state, il_action = ilagent.inference_step(query_embedding, context_embedding, questions_embeddings, answers_embeddings, questions_scores, answers_scores)
+                    state, il_action = ilagent.sample_step(query_embedding, context_embedding, questions_embeddings, answers_embeddings, questions_scores, answers_scores)
 
                     context_, answer_reward, question_reward, correct_question_rank, q_done, good_question, patience_this_turn = user.update_state(val_id, context, questions, answers, use_top_k = max(args.user_tolerance - patience_used, 1))
                     patience_used = max(patience_used + patience_this_turn, args.user_tolerance)
                     output.write('act '+str(action)+' base act '+str(base_action)+' il act '+str(il_action)+' a reward '+str(answer_reward)+' q reward '+str(question_reward) +' cq rank '+str(correct_question_rank) +'\n')
-                    val_output.write(str(i)+' '+str(val_id)+' '+str(n_round)+' '+str(action)+' '+str(base_action)+' '+str(il_action)+' '+str(answer_reward)+' '+str(correct_question_rank) +'\n')
+                    #val_output.write(str(i)+' '+str(val_id)+' '+str(n_round)+' '+str(action)+' '+str(base_action)+' '+str(il_action)+' '+str(answer_reward)+' '+str(correct_question_rank) +'\n')
 
                     a_traj.append((state, answer_reward))
                     q_traj.append((state, correct_question_rank))
@@ -596,40 +657,40 @@ def main(args):
 
                     # ecrr evaluation
                     if 'ecrr' in locals():
-                        if action == 0:
+                        if action == 1:
+                            ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank >= args.reranker_return_length:
+                                ecrr *= answer_reward
+                                val_ecrr.append(ecrr)
+                                del ecrr
+                        else:
                             ecrr *= answer_reward
                             val_ecrr.append(ecrr)
                             del ecrr
-                        else:
-                            if correct_question_rank < args.reranker_return_length:
-                                ecrr *= args.cascade_p**correct_question_rank
-                            else:
-                                val_ecrr.append(0)
-                                del ecrr
                     
                     if 'base_ecrr' in locals():
-                        if base_action == 0:
+                        if base_action == 1 :
+                            base_ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank >= args.reranker_return_length:
+                                base_ecrr *= answer_reward
+                                val_ecrr.append(base_ecrr)
+                                del base_ecrr
+                        else:
                             base_ecrr *= answer_reward
                             val_base_ecrr.append(base_ecrr)
                             del base_ecrr
-                        else:
-                            if correct_question_rank < args.reranker_return_length:
-                                base_ecrr *= args.cascade_p**correct_question_rank
-                            else:
-                                val_base_ecrr.append(0)
-                                del base_ecrr
                     
                     if 'il_ecrr' in locals():
-                        if il_action == 0:
+                        if il_action == 1 :
+                            il_ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank >= args.reranker_return_length:
+                                il_ecrr *= answer_reward
+                                val_il_ecrr.append(il_ecrr)
+                                del il_ecrr
+                        else:
                             il_ecrr *= answer_reward
                             val_il_ecrr.append(il_ecrr)
                             del il_ecrr
-                        else:
-                            if correct_question_rank < args.reranker_return_length:
-                                il_ecrr *= args.cascade_p**correct_question_rank
-                            else:
-                                val_il_ecrr.append(0)
-                                del il_ecrr
 
                     n_round += 1
                     context = context_
@@ -670,7 +731,7 @@ def main(args):
         plt.plot(X, val_il_ecrr_hist, label="val_ecrr")
         plt.legend()
 
-        plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_val.png')
+        #plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_val.png')
 
         ## test 
         test_scores, test_q0_scores, test_q1_scores, test_q2_scores, test_oracle_scores, test_base_scores, test_il_scores = [],[],[],[],[],[],[]
@@ -733,12 +794,11 @@ def main(args):
                     patience_used = max(patience_used + patience_this_turn, args.user_tolerance)
                     
                     output.write('act '+str(action)+' base act '+str(base_action)+' il act '+str(il_action)+' a reward '+str(answer_reward)+' q reward '+str(question_reward) +' cq rank '+str(correct_question_rank) +'\n')
-                    test_output.write(str(i)+' '+str(test_id)+' '+str(n_round)+' '+str(action)+' '+str(base_action)+' '+str(il_action)+' '+str(answer_reward)+' '+str(correct_question_rank) +'\n')
+                    #test_output.write(str(i)+' '+str(test_id)+' '+str(n_round)+' '+str(action)+' '+str(base_action)+' '+str(il_action)+' '+str(answer_reward)+' '+str(correct_question_rank) +'\n')
 
                     a_traj.append((state, answer_reward))
                     q_traj.append((state, correct_question_rank))
                     il_traj.append((state, il_action, [answer_reward, correct_question_rank][il_action]))
-                    #print(answer_reward, correct_question_rank, il_action)
 
                     if n_round >= args.user_patience:
                         q_done = True
@@ -804,41 +864,40 @@ def main(args):
 
                     # ecrr evaluation
                     if 'ecrr' in locals():
-                        if action == 0:
+                        if action == 1:
+                            ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank >= args.reranker_return_length:
+                                ecrr *= answer_reward
+                                test_ecrr.append(ecrr)
+                                del ecrr
+                        else:
                             ecrr *= answer_reward
                             test_ecrr.append(ecrr)
                             del ecrr
-                        else:
-                            if correct_question_rank < args.reranker_return_length:
-                                ecrr *= args.cascade_p**correct_question_rank
-                            else:
-                                test_ecrr.append(0)
-                                del ecrr
                     
                     if 'base_ecrr' in locals():
-                        if base_action == 0:
+                        if base_action == 1 :
+                            base_ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank >= args.reranker_return_length:
+                                base_ecrr *= answer_reward
+                                test_base_ecrr.append(base_ecrr)
+                                del base_ecrr
+                        else:
                             base_ecrr *= answer_reward
                             test_base_ecrr.append(base_ecrr)
                             del base_ecrr
-                        else:
-                            if correct_question_rank < args.reranker_return_length:
-                                base_ecrr *= args.cascade_p**correct_question_rank
-                            else:
-                                test_base_ecrr.append(0)
-                                del base_ecrr
                     
                     if 'il_ecrr' in locals():
-                        if il_action == 0:
+                        if il_action == 1 :
+                            il_ecrr *= args.cascade_p**correct_question_rank
+                            if correct_question_rank >= args.reranker_return_length:
+                                il_ecrr *= answer_reward
+                                test_il_ecrr.append(il_ecrr)
+                                del il_ecrr
+                        else:
                             il_ecrr *= answer_reward
                             test_il_ecrr.append(il_ecrr)
                             del il_ecrr
-                        else:
-                            if correct_question_rank < args.reranker_return_length:
-                                il_ecrr *= args.cascade_p**correct_question_rank
-                            else:
-                                test_il_ecrr.append(0)
-                                del il_ecrr
-
 
                     n_round += 1
                     context = context_
@@ -878,11 +937,11 @@ def main(args):
         plt.plot(X, test_il_mrr_hist, label="test_mrr")
         plt.plot(X, test_il_ecrr_hist, label="test_ecrr")
         plt.legend()
-        plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_test.png')
+        #plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_test.png')
     output.close()
-    train_output.close()
-    val_output.close()
-    test_output.close()
+    #train_output.close()
+    #val_output.close()
+    #test_output.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -895,12 +954,12 @@ if __name__ == '__main__':
     parser.add_argument('--cascade_p', type = float, default = 0.9)
     parser.add_argument('--reranker_return_length', type = int, default = 10)
     parser.add_argument('--observation_dim', type = int, default = 768)
-    parser.add_argument('--lr', type = float, default = 1e-4)
+    parser.add_argument('--lr', type = float, default = 5e-5)
     parser.add_argument('--lrdc', type = float, default = 0.95)
     parser.add_argument('--weight_decay', type = float, default = 1e-2)
     parser.add_argument('--n_action', type = int, default = 2)
     parser.add_argument('--cq_reward', type = float, default = 0.1)
-    parser.add_argument('--train_iter', type = int, default = 50)
+    parser.add_argument('--max_iter', type = int, default = 50)
     parser.add_argument('--batch_size', type = int, default = 100)
     parser.add_argument('--max_data_size', type = int, default = 10000)
     parser.add_argument('--checkpoint', type = str, default = '')
@@ -910,6 +969,10 @@ if __name__ == '__main__':
     parser.add_argument('--max_d_kl', type = float, default = 0.01)
     parser.add_argument('--entropy_weight', type = float, default = 1e-3)
     parser.add_argument('--pmax', type = float, default = 0.8)
+    parser.add_argument('--disc_weight_clip', type = float, default = 0.01)
+    parser.add_argument('--policy_weight_clip', type = float, default = 5)
+    parser.add_argument('--disc_train_ratio', type = int, default = 1)
+    parser.add_argument('--gan_name', type = str, default = 'GAN')
 
     args = parser.parse_args()
     main(args)
