@@ -6,6 +6,7 @@ import logging
 import numpy as np
 import random
 import os
+import time
 import torch as T
 from transformers import AutoTokenizer, AutoModel
 from parlai.scripts.interactive import Interactive, rerank
@@ -224,7 +225,7 @@ def main(args):
     # initialize log directories
     initialize_dirs(args.dataset_name, args.reranker_name, args.cv)
 
-    output = open(args.dataset_name+'_experiments/'+ 'cv' + args.cv + '_' + args.gan_name + '_r' + str(args.cq_reward) +'_cas'+str(args.cascade_p)+'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_discratio'+str(args.disc_train_ratio), 'w')
+    output = open(args.dataset_name+'_experiments/'+ 'cv' + args.cv + '_' + args.gan_name + '_r' + str(args.cq_reward) +'_cas'+str(args.cascade_p)+'_entropyw'+str(args.entropy_weight)+'_discratio'+str(args.disc_train_ratio), 'w')
     #train_output = open(args.dataset_name+'_experiments/'+args.reranker_name + '_r' + str(args.cq_reward) +'_cas'+str(args.cascade_p) +'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_discratio'+str(args.disc_train_ratio)+ '_train', 'w')
     #val_output = open(args.dataset_name+'_experiments/'+args.reranker_name + '_r' + str(args.cq_reward)+'_cas'+str(args.cascade_p) +'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_discratio'+str(args.disc_train_ratio)+ '_val', 'w')
     #test_output = open(args.dataset_name+'_experiments/'+args.reranker_name + '_r' + str(args.cq_reward)+'_cas'+str(args.cascade_p)+'_max_dkl'+str(args.max_d_kl)+'_entropyw'+str(args.entropy_weight)+'_discratio'+str(args.disc_train_ratio) + '_test', 'w')
@@ -269,13 +270,14 @@ def main(args):
         for batch_serial, batch in enumerate(train_dataset.batches):
             all_expert_traj = [] # all conversation trajectories used for il
             all_self_traj = []
+            
             # load state information from cached memory
             if os.path.exists(args.dataset_name + '_experiments/embedding_cache/' + args.reranker_name + '/' + args.cv + '/train/memory.batchsave' + str(batch_serial)):
                 with T.no_grad():
                     memory = T.load(args.dataset_name + '_experiments/embedding_cache/' + args.reranker_name + '/' + args.cv + '/train/memory.batchsave' + str(batch_serial))
             else:
                 memory = {}
-            
+
             train_ids = list(batch['conversations'].keys())
             user = User(batch['conversations'], cq_reward = args.cq_reward, cq_penalty = args.cq_reward - 1)
             for conv_serial, train_id in enumerate(train_ids):
@@ -442,6 +444,7 @@ def main(args):
 
                     context = context_
                     n_round += 1
+                    
                 
                 # find the optimal trajectory using ecrr
                 best_answer_step, best_ecrr = find_best_trajectory(a_traj, q_traj, args.cascade_p)
@@ -472,9 +475,10 @@ def main(args):
                 disc_loss += d_loss
                 '''
 
-            # save memory per batch
+            # save memory per batch and clear some cache
             T.save(memory, args.dataset_name + '_experiments/embedding_cache/' + args.reranker_name + '/' + args.cv + '/train/memory.batchsave' + str(batch_serial))
             del memory
+            del user
             
             d_loss, batch_loss = ilagent.gail_update(all_expert_traj, all_self_traj, disc_train_ratio = args.disc_train_ratio, epoch = i)
             #d_loss, batch_loss = ilagent.ecrr_update(all_expert_traj, all_self_traj)
@@ -510,18 +514,19 @@ def main(args):
         # save checkpoint
         #agent.save(args.dataset_name + '_experiments/checkpoints/' + str(np.mean(agent.loss_history)))
         #base_agent.save(args.dataset_name + '_experiments/checkpoints/' + 'base')
-        ilagent.save(args.dataset_name + '_experiments/checkpoints/' + 'il_' + str(il_loss))
+        ilagent.save(args.dataset_name + '_experiments/checkpoints/' + 'il_' + str(disc_loss))
         
+        '''
+        # plotting
         X.append(i+1)
         train_il_ecrr_hist.append(np.mean(train_il_ecrr))
         train_il_loss_hist.append(il_loss)
-
         plt.figure()
         plt.plot(X, train_il_ecrr_hist, label="train_ecrr")
         plt.plot(X, train_il_loss_hist, label="train_loss")
         plt.legend()
-
-        #plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_train.png')
+        plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_train.png')
+        '''
 
         ## val
         val_scores, val_q0_scores, val_q1_scores, val_q2_scores, val_oracle_scores, val_base_scores, val_il_scores = [],[],[],[],[],[],[]
@@ -723,15 +728,17 @@ def main(args):
         output.write("oracle\tacc %.6f, mrr %.6f, ecrr %.6f, err rate 0\n" % 
             (np.mean([1 if score == 1 else 0 for score in val_oracle_scores]), np.mean(val_oracle_scores), np.mean(val_oracle_ecrr)))
         
+
+        '''
+        # plotting
         val_il_mrr_hist.append(np.mean(val_il_scores))
         val_il_ecrr_hist.append(np.mean(val_il_ecrr))
-
         plt.figure()
         plt.plot(X, val_il_mrr_hist, label="val_mrr")
         plt.plot(X, val_il_ecrr_hist, label="val_ecrr")
         plt.legend()
-
         #plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_val.png')
+        '''
 
         ## test 
         test_scores, test_q0_scores, test_q1_scores, test_q2_scores, test_oracle_scores, test_base_scores, test_il_scores = [],[],[],[],[],[],[]
@@ -930,14 +937,17 @@ def main(args):
         output.write("oracle\tacc %.6f, mrr %.6f, ecrr %.6f, err rate 0\n" % 
             (np.mean([1 if score == 1 else 0 for score in test_oracle_scores]), np.mean(test_oracle_scores), np.mean(test_oracle_ecrr)))
 
+        '''
+        # plotting
         test_il_mrr_hist.append(np.mean(test_il_scores))
         test_il_ecrr_hist.append(np.mean(test_il_ecrr))
-
         plt.figure()
         plt.plot(X, test_il_mrr_hist, label="test_mrr")
         plt.plot(X, test_il_ecrr_hist, label="test_ecrr")
         plt.legend()
-        #plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_test.png')
+        plt.savefig('fig_'+args.dataset_name +'_cv'+ str(args.cv)+'_top'+str(args.user_tolerance)+'_lr'+str(args.lr)+'_r'+str(args.cq_reward)+'_caps'+str(args.cascade_p)+'_test.png')
+        '''
+
     output.close()
     #train_output.close()
     #val_output.close()
