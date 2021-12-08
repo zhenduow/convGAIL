@@ -57,7 +57,7 @@ class Agent():
     The conversational QA agent.
     '''
     def __init__(self, input_dims, n_actions, lr, gamma=0.25, lr_decay = 1e-10, weight_decay = 1e-3,
-                 epsilon=1.0, eps_dec=1e-3, eps_min=0.01, top_k = 1, data_augment = 10):
+                 epsilon=1.0, eps_dec=1e-3, eps_min=0.01, top_k = 1, data_augment = 10, max_experience_length = 8000):
         self.lr = lr
         self.lr_decay = lr_decay
         self.input_dims = input_dims
@@ -73,6 +73,7 @@ class Agent():
         self.experiences = []
         self.experiences_replay_times = 3
         self.loss_history = []
+        self.max_experience_length = max_experience_length
 
         self.Q = LinearDeepQNetwork(self.lr, self.lr_decay, self.weight_decay, self.n_actions, self.input_dims)
         self.device = T.device("cuda")
@@ -105,6 +106,7 @@ class Agent():
         # save to experiences for experience replay
         
         self.experiences.append([state, a_reward, q_reward, state_])
+        self.experiences = self.experiences[-self.max_experience_length:]
         
         if a_reward < q_reward:
             for da in range(self.data_augment):
