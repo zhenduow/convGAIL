@@ -97,8 +97,10 @@ class LinearRDeepNetwork(nn.Module):
         super(LinearRDeepNetwork, self).__init__()
         self.net = nn.Sequential(OrderedDict({
             'fc_1': nn.Linear(input_dims, hidden_size),
+            #'norm_1': nn.LayerNorm(hidden_size),
             'act_1': nn.ReLU(),
             'fc_2': nn.Linear(hidden_size, n_actions),
+            #'norm_2': nn.LayerNorm(n_actions),
             'act_2': nn.Sigmoid()
         }))
         
@@ -116,7 +118,7 @@ class LinearRDeepNetwork(nn.Module):
             if isinstance(m, nn.Linear):
                 T.nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
 
-        self.net.apply(init_kaiming)
+        self.net.apply(init_weights)
 
         self.device = T.device('cuda' if T.cuda.is_available() else 'cpu')
         self.to(self.device)
@@ -367,8 +369,12 @@ class GAILAgent():
             self.disc_optimizer.zero_grad()
             L_disc.backward(retain_graph = True)
             self.disc_optimizer.step()
-            print(dict(self.policy.net.named_children())['fc_1'].weight.grad, flush = True)
-            print(dict(self.policy.net.named_children())['fc_1'].bias.grad, flush = True)
+            '''
+            print(disc_expert_p, disc_self_p)
+            print(L_disc)
+            print(dict(self.disc.net.named_children())['fc_1'].weight.grad)
+            print(dict(self.disc.net.named_children())['fc_1'].bias.grad, flush = True)
+            '''
             if self.gan_name == 'WGAN':
                 for p in self.disc.parameters():
                     p.data.clamp_(-self.disc_weight_clip, self.disc_weight_clip)
@@ -420,14 +426,15 @@ class GAILAgent():
 
 
         self.policy_optimizer.zero_grad()
-        L_pol.backward()    
+        L_pol.backward()
+        print(dict(self.policy.net.named_children())['fc_1'].weight.grad)
+        print(dict(self.policy.net.named_children())['fc_1'].bias.grad, flush = True)
         self.policy_optimizer.step()
         
-        '''    
+          
         for p in self.policy.parameters():
             p.data.clamp_(-self.policy_weight_clip, self.policy_weight_clip)
-        '''
-        self.scheduler.step()
+        
         batch_loss += L_pol.detach().item()
 
         return L_disc.detach().item(), batch_loss
