@@ -279,7 +279,7 @@ class GAILAgent():
     The multi-objective Inverse reinforcement learning Agent for conversational search.
     This agent has multiple policies each represented by one <agent> object.
     '''
-    def __init__(self, n_action, observation_dim, top_n, lr, lrdc, weight_decay, max_d_kl, entropy_weight, pmax, disc_weight_clip, policy_weight_clip, gan_name):
+    def __init__(self, n_action, observation_dim, top_n, lr, lrdc, weight_decay, max_d_kl, entropy_weight, pmax, disc_weight_clip, policy_weight_clip, gan_name, disc_pretrain_epochs):
         self.lr = lr
         self.lrdc = lrdc
         self.weight_decay = weight_decay
@@ -293,7 +293,9 @@ class GAILAgent():
         self.policy_weight_clip = policy_weight_clip
         self.policy = LinearDeepNetwork(n_actions = n_action, input_dims = (2+2*self.top_n) * observation_dim + (2) * self.top_n)
         self.gan_name = gan_name
-        self.disc = LinearDeepNetwork_no_activation(n_actions = 1, input_dims = (2+self.top_n) * observation_dim + self.top_n) if gan_name == 'WGAN' else LinearRDeepNetwork(n_actions = 1, input_dims = (2+self.top_n) * observation_dim + self.top_n)
+        self.disc_pretrain_epochs = disc_pretrain_epochs
+        #self.disc = LinearDeepNetwork_no_activation(n_actions = 1, input_dims = (2+self.top_n) * observation_dim + self.top_n) if gan_name == 'WGAN' else LinearRDeepNetwork(n_actions = 1, input_dims = (2+self.top_n) * observation_dim + self.top_n)
+        self.disc = LinearRDeepNetwork(n_actions = 1, input_dims = (2+self.top_n) * observation_dim + self.top_n)
         self.policyparams = self.policy.parameters()
         self.discparams = self.disc.parameters()
         self.max_d_kl = max_d_kl
@@ -353,8 +355,8 @@ class GAILAgent():
         expert_disc_s_a = T.stack(expert_disc_s_a_list).to(self.device)
 
 
-        if self.gan_name != 'WGAN':
-            disc_train_ratio = 1
+        if self.gan_name == 'WGAN':
+            disc_train_ratio = 5
 
         for di in range(disc_train_ratio):
             disc_self_p = self.disc.forward(self_disc_s_a).to(self.device)
@@ -379,7 +381,7 @@ class GAILAgent():
                 for p in self.disc.parameters():
                     p.data.clamp_(-self.disc_weight_clip, self.disc_weight_clip)
             
-        if epoch < 30:
+        if epoch < self.disc_pretrain_epochs:
             return L_disc.detach().item(), -1000*epoch
 
         # update policy
@@ -388,6 +390,7 @@ class GAILAgent():
             expert_a = [a for _,a in all_expert_traj[k]]
             conv_a_list = T.LongTensor([a for _,a,_ in all_self_traj[k]]).to(self.device)
             conv_s_list = T.stack(([s for s,_,_ in all_self_traj[k]])).to(self.device)
+            print("conv_a_list", conv_a_list)
             conv_disc_s_a_list = []
             conv_disc_s_a_list_2 = []
             for ck, row in enumerate(conv_s_list):
@@ -407,23 +410,37 @@ class GAILAgent():
             conv_disc_s_a_2 = T.stack(conv_disc_s_a_list_2).to(self.device)
 
             for j in range(len(all_self_traj[k])):
-                if j < len(expert_a):
-                    distrib = self.policy.forward(all_self_traj[k][j][0]).to(self.device)
+                print("round", j)
+                print(conv_a_list[j])
+                distrib = self.policy.forward(all_self_traj[k][j][0]).to(self.device)
+
+                if conv_a_list[j] > 0:
                     Qs = self.disc.forward(conv_disc_s_a[j:])
+                    Q = Qs.mean()
+                    Qs_2 = self.disc.forward(conv_disc_s_a_2[j])
+                    Q_2 = Qs_2.mean()
+                else:
+                    Qs = self.disc.forward(conv_disc_s_a[j])
                     Q = Qs.mean()
                     Qs_2 = self.disc.forward(conv_disc_s_a_2[j:])
                     Q_2 = Qs_2.mean()
                     
-                    if distrib[0] > distrib[1]:
-                        p_s_a = distrib[0]
-                        p_s_a_2 = distrib[1]
-                    else:
-                        p_s_a = distrib[1]
-                        p_s_a_2 = distrib[0]
-                    L_pol -= T.log(p_s_a)*Q + T.log(p_s_a_2)*Q_2 + self.entropy_weight * entropy_e([distrib]).to(self.device)
-                    #L_pol -= T.log(p_s_a)*Q  + self.entropy_weight * entropy_e([distrib]).to(self.device)
-                    print(distrib, expert_a[j], Q)
+                print(distrib, Qs, Q,  Qs_2, Q_2)
+                try:
+                    print(expert_a[j])
+                except:
+                    pass
+                L_pol -= T.log(distrib[conv_a_list[j]])* Q + T.log(distrib[1-conv_a_list[j]])*Q_2 + self.entropy_weight * entropy_e([distrib]).to(self.device)
+                #L_pol -= T.log(p_s_a)*Q + T.log(p_s_a_2)*Q_2 + self.entropy_weight * entropy_e([distrib]).to(self.device)
+                #L_pol -= T.log(p_s_a)*Q  + self.entropy_weight * entropy_e([distrib]).to(self.device)
 
+            
+        # l1 penalty
+        l1 = 0
+        for p in self.policy.parameters():
+            l1 += p.abs().sum()
+            
+        L_pol = L_pol + self.weight_decay * l1
 
         self.policy_optimizer.zero_grad()
         L_pol.backward()
@@ -440,7 +457,7 @@ class GAILAgent():
         return L_disc.detach().item(), batch_loss
 
 
-    def inference_step(self, query_embedding, context_embedding, questions_embeddings, answers_embeddings, questions_scores, answers_scores):
+    def inference_step(self, query_embedding, context_embedding, questions_embeddings, answers_embeddings, questions_scores, answers_scores, mode):
         '''
         The inference step of moirl agent first computes the posterior distribution of policies given existing conversation trajectory.
         Then the distribution of policies can be used to compute a weighted reward function.
@@ -454,6 +471,8 @@ class GAILAgent():
         encoded_state = T.cat((encoded_state, answers_scores[:self.top_n]), dim=0)
         state = T.tensor(encoded_state, dtype=T.float).to(self.device)
         pp = self.policy.forward(state)
+        if mode == 'test':
+            print(pp)
         action = T.argmax(pp).item()
         return state, action
     
