@@ -10,7 +10,6 @@ class ConversationDataset():
     def __init__(self, path_to_dataset, batch_size, max_size):
         self.batches = []
         self.max_len = 512
-        print("Reading data from", path_to_dataset, "batch size", batch_size)
         all_data_list = glob.glob(path_to_dataset + '*')
         all_data_list.sort()
         all_data_list = all_data_list[:max_size] # max size
@@ -31,6 +30,7 @@ class ConversationDataset():
             files_in_batch += 1
             if files_in_batch == batch_size:
                 files_in_batch = 0
+        print("Reading ", len(all_data_list) , " data from", path_to_dataset, "batch size", batch_size)
 
 '''
 def processing(input_text, max_len):
