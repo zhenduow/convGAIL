@@ -95,11 +95,10 @@ class User:
             if type(response) == int:
                 continue
             else:
-                if correct_question_id == -1:
-                    #logging.info("Good CQ.")
-                    correct_question_id = qid
-                    user_response_text = response
-                    break
+                #logging.info("Good CQ.")
+                correct_question_id = qid
+                user_response_text = response
+                break
         if 0 <= correct_question_id <= (use_top_k - 1):
             question_reward = self.cq_reward
             patience_used = correct_question_id
