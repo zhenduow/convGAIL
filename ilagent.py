@@ -93,12 +93,13 @@ class LinearRDeepNetwork(nn.Module):
     '''
     The linear deep network used by the agent.
     '''
-    def __init__(self, n_actions, input_dims, hidden_size = 16):
+    def __init__(self, n_actions, input_dims, hidden_size, dropout_ratio):
         super(LinearRDeepNetwork, self).__init__()
         self.net = nn.Sequential(OrderedDict({
             'fc_1': nn.Linear(input_dims, hidden_size),
             #'norm_1': nn.LayerNorm(hidden_size),
             'act_1': nn.ReLU(),
+            'dropout1': nn.Dropout(p=dropout_ratio),
             'fc_2': nn.Linear(hidden_size, n_actions),
             #'norm_2': nn.LayerNorm(n_actions),
             'act_2': nn.Sigmoid()
@@ -279,7 +280,7 @@ class GAILAgent():
     The multi-objective Inverse reinforcement learning Agent for conversational search.
     This agent has multiple policies each represented by one <agent> object.
     '''
-    def __init__(self, n_action, observation_dim, top_n, lr, lrdc, weight_decay, max_d_kl, entropy_weight, pmax, disc_weight_clip, policy_weight_clip, gan_name, disc_pretrain_epochs):
+    def __init__(self, n_action, observation_dim, top_n, lr, lrdc, weight_decay, max_d_kl, entropy_weight, pmax, disc_weight_clip, policy_weight_clip, gan_name, disc_pretrain_epochs, dropout_ratio):
         self.lr = lr
         self.lrdc = lrdc
         self.weight_decay = weight_decay
@@ -295,7 +296,7 @@ class GAILAgent():
         self.gan_name = gan_name
         self.disc_pretrain_epochs = disc_pretrain_epochs
         #self.disc = LinearDeepNetwork_no_activation(n_actions = 1, input_dims = (2+self.top_n) * observation_dim + self.top_n) if gan_name == 'WGAN' else LinearRDeepNetwork(n_actions = 1, input_dims = (2+self.top_n) * observation_dim + self.top_n)
-        self.disc = LinearRDeepNetwork(n_actions = 1, input_dims = (2+self.top_n) * observation_dim + self.top_n)
+        self.disc = LinearRDeepNetwork(n_actions = 1, input_dims = (2+self.top_n) * observation_dim + self.top_n, hidden_size = 16, dropout_ratio = dropout_ratio)
         self.policyparams = self.policy.parameters()
         self.discparams = self.disc.parameters()
         self.max_d_kl = max_d_kl
@@ -322,6 +323,9 @@ class GAILAgent():
         batch_loss = 0
         eps = 1e-4
 
+        # filter out self traj that is best traj
+        all_self_traj = [self_traj for self_traj in all_self_traj if self_traj[-1][-1] < 1]
+        
         self_a_list = T.LongTensor([a for self_traj in all_self_traj for _,a,_ in self_traj]).to(self.device)
         self_s_list = T.stack(([s for self_traj in all_self_traj for s,_,_ in self_traj])).to(self.device)
         self_p_list = T.tensor([1-p for self_traj in all_self_traj for _,_,p in self_traj]).to(self.device)
@@ -382,7 +386,7 @@ class GAILAgent():
                     p.data.clamp_(-self.disc_weight_clip, self.disc_weight_clip)
             
         if epoch < self.disc_pretrain_epochs:
-            return L_disc.detach().item(), -1000*epoch
+            return L_disc.detach().item(), -1000 * epoch
 
         # update policy
         L_pol = T.zeros(1).to(self.device)
@@ -435,7 +439,7 @@ class GAILAgent():
                 #L_pol -= T.log(p_s_a)*Q  + self.entropy_weight * entropy_e([distrib]).to(self.device)
 
             
-        # l1 penalty
+        # l1 penalty or try l2.
         l1 = 0
         for p in self.policy.parameters():
             l1 += p.abs().sum()
