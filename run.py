@@ -244,7 +244,7 @@ def main(args):
     # initialize agents
     agent = Agent(lr = 1e-4, input_dims = (3 + args.user_tolerance) * args.observation_dim + 1 + args.user_tolerance, top_k = args.user_tolerance, n_actions=args.n_action, gamma = 1 - args.cq_reward, weight_decay = 0.01, max_experience_length = 5 * data_size) # query, context, answer, and topn questions embedding + 1 answer score and topn question score
     base_agent = BaseAgent(lr = 1e-4, input_dims = 2 * args.observation_dim, n_actions = args.n_action, weight_decay = args.weight_decay)
-    ilagent = GAILAgent(n_action = args.n_action, observation_dim = args.observation_dim, top_n = args.il_topn, lr= args.lr, lrdc=args.lrdc, weight_decay= args.weight_decay, max_d_kl = args.max_d_kl, entropy_weight = args.entropy_weight, pmax=args.pmax, disc_weight_clip = args.disc_weight_clip, policy_weight_clip = args.policy_weight_clip, gan_name = args.gan_name, disc_pretrain_epochs = args.disc_pretrain_epochs)
+    ilagent = GAILAgent(n_action = args.n_action, observation_dim = args.observation_dim, top_n = args.il_topn, lr= args.lr, lrdc=args.lrdc, weight_decay= args.weight_decay, max_d_kl = args.max_d_kl, entropy_weight = args.entropy_weight, pmax=args.pmax, disc_weight_clip = args.disc_weight_clip, policy_weight_clip = args.policy_weight_clip, gan_name = args.gan_name, disc_pretrain_epochs = args.disc_pretrain_epochs, dropout_ratio = args.dropout_ratio)
     
     # initialize embedding model
     tokenizer = AutoTokenizer.from_pretrained('xlnet-base-cased')
@@ -1006,6 +1006,7 @@ if __name__ == '__main__':
     parser.add_argument('--disc_pretrain_epochs', type = int, default = 30)
     parser.add_argument('--risk_run_epoch', type = int, default = 20)
     parser.add_argument('--base_run_epoch', type = int, default = 20)
+    parser.add_argument('--dropout_ratio', type = float, default = 0.2)
 
     args = parser.parse_args()
     main(args)
