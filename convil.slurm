@@ -26,7 +26,7 @@ srun python3.6 run.py \
 --il_topn 10 \
 --max_data_size 10000 \
 --max_iter 200 \
---gan_name WGAN \
+--gan_name LSGAN \
 --risk_run_epoch 0 \
 --base_run_epoch 0 \
 --disc_pretrain_epochs 30 \
