@@ -10,6 +10,10 @@ A risk-aware conversational search system consisting of pretrained answer and qu
     ```
     This will process and filter the data. All conversations that meet the filtering criterion are saved in MSDialog-Complete and will be automatically split into training and testing set. The others are save in MSDialog-Incomplete. The former is used for the main experiments and the latter is used for fine-tuning the rerankers only.
 1. Fine-tune pretrained reranker checkpoints on dataset (MSDialog as example)
+   1.1 Install subword-nmt:
+    ```
+    pip install 'git+https://github.com/rsennrich/subword-nmt.git#egg=subword-nmt'
+    ```
     ```
     cd ParlAI
     python3 -u examples/train_model.py \
