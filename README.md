@@ -66,3 +66,8 @@ A risk-aware conversational search system consisting of pretrained answer and qu
     python3  run_sampling.py --dataset_name MSDialog --reranker_name Poly --topn 1 --cv 0 > your_log_file
     ```
     `--dataset_name` can be 'MSDialog', 'UDC', or 'Opendialkg' currently. `--reranker_name` can be 'Poly' or 'Bi' currently. `--topn` means the top n reranked candidates are considered correct, i.e. `--topn ` computes recall@1. The MSDialog dataset is too small, so it's recommended to run it using cross validation. When the dataset size is big enough or there is no need to run cross validation, simply use `--cv -1` to turn off cross validation. The experiment would take a couple of hours to one day. So, it's recommended to save the results to a log file.
+
+   If it prompts the error for ParlAI path, add ParlAI to PYTHONPATH by:
+   ```
+   export PYTHONPATH="${PYTHONPATH}:path_to_repo/convGAIL/ParlAI"
+   ```
