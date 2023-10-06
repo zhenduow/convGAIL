@@ -9,7 +9,7 @@
 
 
 export CUDA_VISIBLE_DEVICES=0
-srun python3.6 run.py \
+srun python run.py \
 --dataset_name UDC \
 --cv 0 \
 --reranker_name poly \
